@@ -1,0 +1,20 @@
+# Block Python temporary caches and environments
+Backend/.env
+Backend/.venv/
+Backend/venv/
+Backend/__pycache__/
+*.pyc
+.pytest_cache/
+
+# Block Google Service Account Secrets securely
+Backend/credentials/*.json
+!Backend/credentials/.gitkeep
+
+# Block Frontend production compiler caches and local modules
+Frontend/.next/
+Frontend/node_modules/
+Frontend/pnpm-lock.yaml
+
+# Block Editor configurations
+.idea/
+.vscode/
