@@ -12,7 +12,7 @@ Sales and marketing teams spend over **20+ manual hours every week** manually lo
 ### The Solution
 This automation engine completely eliminates manual outreach research, driving a **90% operational efficiency gain**:
 * **Instant Extraction:** Automatically parses hundreds of target business listings in under 5 seconds.
-* **Intelligent AI Filtering:** Uses **Gemini 3.5-Flash / 3.5-Flash** models to evaluate each business type and filter out low-value prospects automatically.
+* **Intelligent AI Filtering:** Uses **Gemini 3.5-Flash** models to evaluate each business type and filter out low-value prospects automatically.
 * **Zero-Input CRM Sync:** Populates your Google Sheets and CRM databases in real-time with verified contact info, ready-to-use personalization insights, and strategic reasoning.
 
 ---
@@ -42,37 +42,38 @@ Google Sheets CRM Database  <═══>  FastAPI Local REST Server (:8000)
 
 ## 📂 Project Structure
 
-lead-gen-engine/                 # 💎 Main Root Project Directory
-├── .gitignore                   # Main rule file to block credentials upload
-├── README.md                    # Professional documentation for clients & devs
-│
-├── Backend/                     # 🐍 Robust Python Automation Engine
-│   ├── .env                     # Private storage (Gemini API Key, Google Sheet ID)
-│   ├── .env.example             # Safe template placeholder file for deployment
-│   ├── api.py                   # FastAPI Live Server with async caching gateway
-│   ├── main.py                  # Core pipeline manager (scrapes → AI scores → pushes)
-│   ├── ai_filter.py             # Custom Gemini 3.5-Flash text evaluation engine
-│   ├── scraper.py               # BeautifulSoup4 high-speed directory parser
-│   ├── sheet_manager.py         # Google Sheets Cloud gspread connector scripts
-│   ├── requirements.txt         # Package dependency manifest (fastapi, google-genai)
-│   │
-│   ├── credentials/             # 🔒 Cryptographic Access Vault
-│   │   ├── .gitkeep             # Ensures folder tracking without exposing raw keys
-│   │   └── service_account.json # Private Google Service Account IAM Secret Key
-│   │
-│   └── data/                    # Local Sandbox Environment
-│       └── mock_leads.html      # Local HTML baseline for automated testing
-│
-└── Frontend/                    # ⚛️ Next.js Enterprise SaaS Analytics Dashboard
-    ├── package.json             # Application scripts scheduler & package configs
-    ├── tsconfig.json            # Strict TypeScript architectural definitions
-    ├── postcss.config.mjs       # CSS style compilers configuration file
-    ├── tailwind.config.mjs      # Premium UI custom color framework layouts
-    ├── next.config.mjs          # Next.js engine runtime settings controller
-    ├── components.json          # Modern Shadcn UI component trackers layout
-    ├── .gitignore               # Frontend local modules protection parameters
-    └── .next/                   # Next.js production compiler automated cache
-
+```text
+lead-gen-engine/
+├── .gitignore
+├── README.md
+├── Backend/
+│   ├── credentials/
+│   │   ├── .gitkeep
+│   │   └── service_account.json
+│   ├── data/
+│   │   └── mock_leads.html
+│   ├── .env
+│   ├── .env.example
+│   ├── ai_filter.py
+│   ├── api.py
+│   ├── config.py
+│   ├── main.py
+│   ├── requirements.txt
+│   ├── scraper.py
+│   └── sheet_manager.py
+└── Frontend/
+    ├── .next/
+    ├── .gitignore
+    ├── components.json
+    ├── next-env.d.ts
+    ├── next.config.mjs
+    ├── package-lock.json
+    ├── package.json
+    ├── pnpm-lock.yaml
+    ├── pnpm-workspace.yaml
+    ├── postcss.config.mjs
+    └── tsconfig.json
+```
 
 ---
 
@@ -81,7 +82,7 @@ lead-gen-engine/                 # 💎 Main Root Project Directory
 ### 1. Fire Up the Backend API Server
 Ensure your python virtual environment (`.venv`) is activated:
 ```bash
-cd backend
+cd Backend
 pip install -r requirements.txt
 uvicorn api:app --reload
 ```
@@ -90,9 +91,9 @@ uvicorn api:app --reload
 ### 2. Launch the Frontend Dashboard View
 Open a new terminal tab and install Node dependencies:
 ```bash
-cd frontend
-npm install
-npm run dev
+cd Frontend
+pnpm install
+pnpm run dev
 ```
 *Click the local URL generated in your terminal (usually `http://localhost:3000`) to view the interactive live tracking workspace!*
 
