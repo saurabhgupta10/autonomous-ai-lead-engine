@@ -1,6 +1,18 @@
+# Core scraping
 beautifulsoup4==4.12.3
 requests==2.32.3
-google-generativeai==0.8.3
+
+# Google Gemini (new unified SDK — matches "from google import genai" imports)
+google-genai>=1.16.0
+
+# Google Sheets
 gspread==6.1.4
-google-auth==2.35.0
+google-auth==2.61.0
+
+# FastAPI server
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# Config / utilities
 python-dotenv==1.0.1
