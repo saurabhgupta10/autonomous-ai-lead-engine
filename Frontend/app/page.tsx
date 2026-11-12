@@ -9,15 +9,22 @@ import {
   ChevronDown,
   CircleHelp,
   Clock3,
+  Compass,
+  ExternalLink,
   FileText,
   Filter,
+  Globe,
+  Globe2,
   LayoutDashboard,
   Loader2,
   Mail,
+  MapPin,
   Menu,
+  Phone,
   RefreshCw,
   Search,
   Settings2,
+  ShieldCheck,
   Sparkles,
   Target,
   TrendingUp,
@@ -39,47 +46,106 @@ interface LeadItem {
   id: string
   timestamp: string
   company: string
+  country: string
+  city: string
+  industry: string
   website: string
   email: string
+  phone: string
+  websiteStatus: 'working' | 'broken' | 'missing' | 'unverified' | string
+  opportunityType: string
   priority: 'High' | 'Medium' | 'Low' | 'Unscored' | string
   summary: string
+  evidence: string
+  sourceUrl: string
+  discoveryProvider: string
   initials: string
+}
+
+interface DiscoverySummary {
+  total_discovered: number
+  with_website_count: number
+  without_website_count: number
+  high_priority_count: number
+  duplicates_skipped: number
+  crm_synced: number
+  stage?: string
+  query?: {
+    country: string
+    city: string
+    industry: string
+    limit: number
+  }
 }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
+const TARGET_COUNTRIES = ['USA', 'UK', 'Australia', 'UAE', 'Canada', 'Germany']
+const COMMON_INDUSTRIES = [
+  'Restaurants',
+  'Salons',
+  'Dentists',
+  'Healthcare',
+  'Fitness',
+  'Logistics',
+  'Bakeries',
+  'Law Firms',
+  'Real Estate',
+]
+
 export default function Page() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [activeTab, setActiveTab] = useState<'Overview' | 'Lead Feed' | 'AI Insights' | 'Campaigns'>('Overview')
+  const [activeTab, setActiveTab] = useState<'Overview' | 'Lead Feed' | 'AI Insights' | 'Discovery'>('Overview')
   
   // Data state
   const [leads, setLeads] = useState<LeadItem[]>([])
+  const [discoveryResults, setDiscoveryResults] = useState<LeadItem[]>([])
+  const [viewSource, setViewSource] = useState<'crm' | 'discovery'>('crm')
   const [loading, setLoading] = useState(true)
   const [apiError, setApiError] = useState<string | null>(null)
-  const [agentModel, setAgentModel] = useState<string>('Gemini Engine')
+  const [agentModel, setAgentModel] = useState<string>('Gemini Flash')
   const [lastSyncTime, setLastSyncTime] = useState<string>('Never')
 
   // Search, filter & sort state
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [priorityFilter, setPriorityFilter] = useState<'All' | 'High' | 'Medium' | 'Low'>('All')
+  const [opportunityFilter, setOpportunityFilter] = useState<string>('All')
   const [sortDescending, setSortDescending] = useState(true)
 
-  // Scan state
-  const [isScanning, setIsScanning] = useState(false)
-  const [scanNotification, setScanNotification] = useState<{ message: string; type: 'success' | 'info' | 'error' } | null>(null)
+  // Discovery Form State
+  const [discCountry, setDiscCountry] = useState('USA')
+  const [discCity, setDiscCity] = useState('New York')
+  const [discIndustry, setDiscIndustry] = useState('Restaurants')
+  const [discLimit, setDiscLimit] = useState(20)
+  const [isDiscovering, setIsDiscovering] = useState(false)
+  const [discoveryStage, setDiscoveryStage] = useState<string | null>(null)
+  const [lastDiscoverySummary, setLastDiscoverySummary] = useState<DiscoverySummary | null>(null)
 
-  // Normalize backend / Google Sheets row formats into LeadItem
+  // URL Scan state (preserved)
+  const [isScanning, setIsScanning] = useState(false)
+  const [notification, setNotification] = useState<{ message: string; type: 'success' | 'info' | 'error' } | null>(null)
+
+  // Normalize raw record into LeadItem
   const normalizeLead = (record: RawLeadRecord, index: number): LeadItem => {
     const company =
-      record['Company Name'] || record.company_name || record.company || record.Company || 'Unknown Prospect'
+      record['Business Name'] || record['Company Name'] || record.business_name || record.company_name || record.company || 'Unknown Prospect'
     const timestamp =
-      record['Timestamp (UTC)'] || record.timestamp || record.Captured || record.created_at || 'Recently'
+      record['Timestamp (UTC)'] || record.timestamp || record['Discovery Date'] || record.Captured || 'Recently'
+    const country = record.Country || record.country || 'Global'
+    const city = record.City || record.city || ''
+    const industry = record.Industry || record.industry || record['Business Category'] || record.business_category || 'Business'
     const website = record.Website || record.website || ''
-    const email = record.Email || record.email || 'N/A'
+    const email = record.Email || record.email || ''
+    const phone = record.Phone || record.phone || ''
+    const websiteStatus = record['Website Status'] || record.website_status || (website ? 'working' : 'missing')
+    const opportunityType = record['Opportunity Type'] || record.opportunity_type || 'General Automation'
     const priority = record.Priority || record.priority || 'Medium'
     const summary =
-      record.Reason || record.reason || record.summary || record.AI_analysis || record.description || 'No analysis recorded.'
+      record['AI Reasoning'] || record.Reason || record.reason || record.summary || record.description || 'No analysis recorded.'
+    const evidence = record.Evidence || record.evidence || ''
+    const sourceUrl = record['Source URL'] || record.source_url || ''
+    const discoveryProvider = record['Discovery Provider'] || record.discovery_provider || 'openstreetmap_overpass'
 
     const initials =
       company
@@ -91,24 +157,32 @@ export default function Page() {
         .toUpperCase() || 'CO'
 
     return {
-      id: `${company}-${index}`,
+      id: `${company}-${city}-${index}`,
       timestamp,
       company,
+      country,
+      city,
+      industry,
       website,
       email,
+      phone,
+      websiteStatus,
+      opportunityType,
       priority,
       summary,
+      evidence,
+      sourceUrl,
+      discoveryProvider,
       initials,
     }
   }
 
-  // Fetch leads from backend
+  // Fetch leads from backend CRM
   const fetchLeads = useCallback(async () => {
     try {
       setLoading(true)
       setApiError(null)
 
-      // Fetch health for metadata
       try {
         const healthRes = await fetch(`${API_BASE}/health`)
         if (healthRes.ok) {
@@ -118,7 +192,7 @@ export default function Page() {
           }
         }
       } catch {
-        // Optional metadata fetch error ignored
+        // metadata fetch non-blocking
       }
 
       const res = await fetch(`${API_BASE}/api/leads`)
@@ -145,11 +219,108 @@ export default function Page() {
     fetchLeads()
   }, [fetchLeads])
 
-  // Trigger lead scan pipeline
+  // Start Autonomous Business Discovery (Phase 5)
+  const startAutonomousDiscovery = async () => {
+    if (isDiscovering) return
+    setIsDiscovering(true)
+    setDiscoveryStage('Querying OpenStreetMap Provider...')
+    setNotification({
+      message: `Searching for ${discIndustry} in ${discCity}, ${discCountry}...`,
+      type: 'info',
+    })
+
+    try {
+      const res = await fetch(`${API_BASE}/api/discovery/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          country: discCountry,
+          city: discCity,
+          industry: discIndustry,
+          limit: Number(discLimit),
+        }),
+      })
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => null)
+        throw new Error(errJson?.detail?.error || 'Discovery start request failed.')
+      }
+
+      // Poll discovery status
+      let pollCount = 0
+      const poll = setInterval(async () => {
+        pollCount += 1
+        try {
+          const statusRes = await fetch(`${API_BASE}/api/discovery/status`)
+          if (statusRes.ok) {
+            const statusData = await statusRes.json()
+            const stage = statusData.summary?.stage
+            if (stage === 'querying_provider') {
+              setDiscoveryStage('Querying OpenStreetMap Provider...')
+            } else if (stage === 'auditing_websites') {
+              setDiscoveryStage('Deep Crawling & Technical Website Auditing...')
+            } else if (stage === 'ai_qualification') {
+              setDiscoveryStage('Gemini AI Opportunity Qualification...')
+            } else if (stage === 'crm_sync') {
+              setDiscoveryStage('Google Sheets CRM Sync & Deduplication...')
+            }
+
+            if (statusData.status === 'complete') {
+              clearInterval(poll)
+              setIsDiscovering(false)
+              setDiscoveryStage(null)
+              const sum = statusData.summary || {}
+              setLastDiscoverySummary(sum)
+
+              // Fetch latest discovery results
+              const resultsRes = await fetch(`${API_BASE}/api/discovery/results`)
+              if (resultsRes.ok) {
+                const resultsData = await resultsRes.json()
+                const recs = (resultsData.results || []).map((r: any, i: number) => normalizeLead(r, i))
+                setDiscoveryResults(recs)
+                setViewSource('discovery')
+              }
+
+              setNotification({
+                message: `Discovery complete! Found ${sum.total_discovered} real businesses (${sum.high_priority_count} High Priority). Saved ${sum.crm_synced} to CRM (${sum.duplicates_skipped} duplicates skipped).`,
+                type: 'success',
+              })
+
+              fetchLeads()
+            } else if (statusData.status === 'error') {
+              clearInterval(poll)
+              setIsDiscovering(false)
+              setDiscoveryStage(null)
+              setNotification({
+                message: `Discovery failed: ${statusData.error || 'Provider timeout'}`,
+                type: 'error',
+              })
+            }
+          }
+        } catch {
+          // ignore transient poll error
+        }
+
+        if (pollCount > 40) {
+          clearInterval(poll)
+          setIsDiscovering(false)
+          setDiscoveryStage(null)
+          setNotification({ message: 'Discovery request still processing in background. Refreshing...', type: 'info' })
+          fetchLeads()
+        }
+      }, 2000)
+    } catch (err: any) {
+      setIsDiscovering(false)
+      setDiscoveryStage(null)
+      setNotification({ message: err.message || 'Failed to start discovery.', type: 'error' })
+    }
+  }
+
+  // Trigger legacy URL AI Scan
   const runAiScan = async () => {
     if (isScanning) return
     setIsScanning(true)
-    setScanNotification({ message: 'Initiating lead scan & AI scoring...', type: 'info' })
+    setNotification({ message: 'Initiating directory scraper & AI scoring...', type: 'info' })
 
     try {
       const scanRes = await fetch(`${API_BASE}/api/scan`, {
@@ -163,7 +334,6 @@ export default function Page() {
         throw new Error(errJson?.detail?.error || errJson?.detail || 'Scan request failed.')
       }
 
-      // Poll scan status until completion
       let attempts = 0
       const pollInterval = setInterval(async () => {
         attempts += 1
@@ -175,42 +345,44 @@ export default function Page() {
               clearInterval(pollInterval)
               setIsScanning(false)
               const sum = statusData.summary || {}
-              setScanNotification({
-                message: `Scan complete! Scraped ${sum.scraped || 0} leads, identified ${sum.high || 0} High priority, saved to CRM.`,
+              setNotification({
+                message: `Scan complete! Scraped ${sum.scraped || 0} leads, identified ${sum.high || 0} High priority.`,
                 type: 'success',
               })
               fetchLeads()
             } else if (statusData.status === 'error') {
               clearInterval(pollInterval)
               setIsScanning(false)
-              setScanNotification({
+              setNotification({
                 message: `Scan error: ${statusData.error || 'Pipeline failed'}`,
                 type: 'error',
               })
             }
           }
         } catch {
-          // ignore transient poll error
+          // ignore
         }
 
         if (attempts > 30) {
           clearInterval(pollInterval)
           setIsScanning(false)
-          setScanNotification({ message: 'Scan timed out. Refreshing data...', type: 'info' })
           fetchLeads()
         }
       }, 1500)
     } catch (err: any) {
       setIsScanning(false)
-      setScanNotification({ message: err.message || 'Failed to trigger scan.', type: 'error' })
+      setNotification({ message: err.message || 'Failed to trigger scan.', type: 'error' })
     }
   }
 
+  // Active dataset according to view mode
+  const activeDataset = viewSource === 'discovery' && discoveryResults.length > 0 ? discoveryResults : leads
+
   // Filtered and sorted leads
   const processedLeads = useMemo(() => {
-    let result = [...leads]
+    let result = [...activeDataset]
 
-    // Workspace tab filter
+    // Sidebar Tab filter
     if (activeTab === 'AI Insights') {
       result = result.filter((l) => l.priority.toLowerCase() === 'high')
     }
@@ -220,14 +392,24 @@ export default function Page() {
       result = result.filter((l) => l.priority.toLowerCase() === priorityFilter.toLowerCase())
     }
 
+    // Opportunity type filter
+    if (opportunityFilter !== 'All') {
+      result = result.filter((l) => l.opportunityType.toLowerCase() === opportunityFilter.toLowerCase())
+    }
+
     // Search query
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase().trim()
       result = result.filter(
         (l) =>
           l.company.toLowerCase().includes(q) ||
+          l.city.toLowerCase().includes(q) ||
+          l.country.toLowerCase().includes(q) ||
+          l.industry.toLowerCase().includes(q) ||
           l.email.toLowerCase().includes(q) ||
+          l.phone.toLowerCase().includes(q) ||
           l.summary.toLowerCase().includes(q) ||
+          l.opportunityType.toLowerCase().includes(q) ||
           l.website.toLowerCase().includes(q)
       )
     }
@@ -239,18 +421,20 @@ export default function Page() {
     })
 
     return result
-  }, [leads, activeTab, priorityFilter, searchQuery, sortDescending])
+  }, [activeDataset, activeTab, priorityFilter, opportunityFilter, searchQuery, sortDescending])
 
   // Dynamic metrics calculations
   const totalCount = leads.length
   const highPriorityCount = leads.filter((l) => l.priority.toLowerCase() === 'high').length
   const highPercentage = totalCount > 0 ? Math.round((highPriorityCount / totalCount) * 100) : 0
+  const websitesFoundCount = leads.filter((l) => l.website && l.websiteStatus !== 'missing').length
+  const websitesMissingCount = leads.filter((l) => !l.website || l.websiteStatus === 'missing').length
 
   const navItems = [
     { label: 'Overview' as const, icon: LayoutDashboard },
     { label: 'Lead Feed' as const, icon: Target },
     { label: 'AI Insights' as const, icon: Sparkles },
-    { label: 'Campaigns' as const, icon: TrendingUp },
+    { label: 'Discovery' as const, icon: Compass },
   ]
 
   return (
@@ -268,7 +452,7 @@ export default function Page() {
             </div>
             <div>
               <p className="text-[14px] font-semibold tracking-tight">Lead Engine</p>
-              <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">AI-powered growth</p>
+              <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Autonomous Discovery</p>
             </div>
           </div>
 
@@ -299,6 +483,9 @@ export default function Page() {
                       {highPriorityCount}
                     </span>
                   )}
+                  {item.label === 'Discovery' && isDiscovering && (
+                    <span className="ml-auto size-2 rounded-full bg-amber-400 animate-ping" />
+                  )}
                 </Button>
               )
             })}
@@ -312,7 +499,7 @@ export default function Page() {
               className="justify-start gap-3 rounded-lg px-3 text-[13px] font-medium text-slate-400 hover:bg-white/[0.05] hover:text-slate-100"
             >
               <RefreshCw className={`size-[17px] ${loading ? 'animate-spin' : ''}`} />
-              Refresh Data
+              Refresh CRM
             </Button>
             <Button
               variant="ghost"
@@ -320,29 +507,35 @@ export default function Page() {
               className="justify-start gap-3 rounded-lg px-3 text-[13px] font-medium text-slate-400 hover:bg-white/[0.05] hover:text-slate-100"
             >
               <Filter className="size-[17px]" />
-              Filter: {priorityFilter}
+              Priority: {priorityFilter}
             </Button>
           </div>
 
           <div className="mt-auto rounded-xl border border-emerald-400/15 bg-emerald-400/[0.06] p-3">
             <div className="flex items-center gap-2">
-              <span className={`size-2 rounded-full ${isScanning ? 'animate-pulse bg-amber-400 shadow-[0_0_10px_#fbbf24]' : 'bg-emerald-400 shadow-[0_0_10px_#34d399]'}`} />
+              <span
+                className={`size-2 rounded-full ${
+                  isDiscovering || isScanning
+                    ? 'animate-pulse bg-amber-400 shadow-[0_0_10px_#fbbf24]'
+                    : 'bg-emerald-400 shadow-[0_0_10px_#34d399]'
+                }`}
+              />
               <span className="text-xs font-medium text-emerald-300">
-                {isScanning ? 'Scanner Active' : 'Agent Ready'}
+                {isDiscovering ? 'Discovery Active' : isScanning ? 'Scanner Active' : 'Autonomous Engine'}
               </span>
             </div>
             <p className="mt-2 text-[11px] leading-relaxed text-slate-500">
-              {isScanning ? 'Extracting and scoring leads with Gemini...' : `Connected to API at ${API_BASE.replace('http://', '')}`}
+              {discoveryStage || 'OpenStreetMap Discovery & Gemini Intelligence ready.'}
             </p>
           </div>
 
           <div className="mt-5 flex items-center gap-3 border-t border-white/[0.07] px-2 pt-4">
             <div className="flex size-8 items-center justify-center rounded-full bg-gradient-to-br from-violet-400 to-indigo-500 text-[11px] font-bold">
-              JD
+              SA
             </div>
             <div className="min-w-0 flex-1">
-              <p className="truncate text-xs font-medium">Jordan Davis</p>
-              <p className="truncate text-[10px] text-slate-500">Growth team</p>
+              <p className="truncate text-xs font-medium">Saurabh Gupta</p>
+              <p className="truncate text-[10px] text-slate-500">Growth Architect</p>
             </div>
             <ChevronDown className="size-4 text-slate-600" />
           </div>
@@ -363,9 +556,9 @@ export default function Page() {
                 <Menu />
               </Button>
               <div>
-                <p className="text-xs text-slate-500">Autonomous Sales Pipeline</p>
+                <p className="text-xs text-slate-500">Autonomous B2B Discovery Platform</p>
                 <h1 className="mt-0.5 text-lg font-semibold tracking-tight text-slate-50">
-                  Dashboard <span className="text-slate-500">/</span> {activeTab}
+                  Lead Engine <span className="text-slate-500">/</span> {activeTab}
                 </h1>
               </div>
             </div>
@@ -378,7 +571,7 @@ export default function Page() {
                     type="text"
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Search leads, emails, analysis..."
+                    placeholder="Search by company, city, opportunity..."
                     className="h-9 w-48 rounded-lg border border-white/[0.12] bg-[#0d1118] px-3 py-1 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-400 sm:w-64"
                     autoFocus
                   />
@@ -419,49 +612,41 @@ export default function Page() {
 
               <div className="ml-2 hidden h-6 w-px bg-white/[0.08] sm:block" />
 
-              {/* Run AI Scan Button */}
+              {/* Legacy Quick URL Scan */}
               <Button
                 onClick={runAiScan}
-                disabled={isScanning}
-                className="ml-1 hidden h-9 gap-2 rounded-lg bg-emerald-400 px-3 text-xs font-semibold text-[#07100d] hover:bg-emerald-300 disabled:opacity-50 sm:flex"
+                disabled={isScanning || isDiscovering}
+                variant="outline"
+                className="hidden h-9 gap-1.5 border-white/[0.1] bg-transparent text-xs text-slate-300 hover:bg-white/[0.05] sm:flex"
               >
-                {isScanning ? (
-                  <>
-                    <Loader2 className="size-3.5 animate-spin" />
-                    Scanning...
-                  </>
-                ) : (
-                  <>
-                    <Sparkles className="size-3.5" />
-                    Run AI scan
-                  </>
-                )}
+                {isScanning ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5 text-violet-400" />}
+                URL Scan
               </Button>
             </div>
           </header>
 
           <div className="mx-auto max-w-[1440px] px-5 py-7 sm:px-8 lg:py-9">
             {/* Notification Banner */}
-            {scanNotification && (
+            {notification && (
               <div
                 className={`mb-6 flex items-center justify-between rounded-lg border px-4 py-3 text-xs ${
-                  scanNotification.type === 'success'
+                  notification.type === 'success'
                     ? 'border-emerald-400/20 bg-emerald-400/10 text-emerald-300'
-                    : scanNotification.type === 'error'
+                    : notification.type === 'error'
                     ? 'border-red-400/20 bg-red-400/10 text-red-300'
                     : 'border-blue-400/20 bg-blue-400/10 text-blue-300'
                 }`}
               >
                 <div className="flex items-center gap-2">
-                  {scanNotification.type === 'success' ? (
+                  {notification.type === 'success' ? (
                     <CheckCircle2 className="size-4" />
                   ) : (
                     <AlertCircle className="size-4" />
                   )}
-                  <span>{scanNotification.message}</span>
+                  <span>{notification.message}</span>
                 </div>
                 <button
-                  onClick={() => setScanNotification(null)}
+                  onClick={() => setNotification(null)}
                   className="text-slate-400 hover:text-slate-200"
                 >
                   <X className="size-3.5" />
@@ -475,7 +660,7 @@ export default function Page() {
                 <div className="flex items-center gap-2">
                   <AlertCircle className="size-4 shrink-0" />
                   <span>
-                    Backend communication note: {apiError}. Ensure the FastAPI server is running (`uvicorn api:app --reload`).
+                    Backend communication note: {apiError}. Ensure FastAPI is running on port 8000.
                   </span>
                 </div>
                 <Button
@@ -489,55 +674,168 @@ export default function Page() {
               </div>
             )}
 
-            {/* Hero / Header text */}
-            <div className="mb-7 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
-              <div>
-                <div className="mb-2 flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.18em] text-emerald-300">
-                  <Activity className="size-3.5" /> Live intelligence
+            {/* Autonomous Discovery Controller Card */}
+            <Card className="mb-8 border-white/[0.08] bg-[#0d1118] p-5 shadow-xl">
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col justify-between gap-2 sm:flex-row sm:items-center">
+                  <div className="flex items-center gap-2.5">
+                    <div className="flex size-7 items-center justify-center rounded-lg bg-emerald-400/10 text-emerald-400">
+                      <Compass className="size-4" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-semibold text-slate-100">
+                        Autonomous Business Discovery & Audit Engine
+                      </h3>
+                      <p className="text-[11px] text-slate-500">
+                        Discover genuine businesses from OpenStreetMap, conduct security & website audits, and qualify opportunities with Gemini
+                      </p>
+                    </div>
+                  </div>
+
+                  {discoveryStage && (
+                    <div className="flex items-center gap-2 rounded-md bg-amber-400/10 px-3 py-1.5 text-xs text-amber-300 border border-amber-400/20">
+                      <Loader2 className="size-3.5 animate-spin" />
+                      <span>{discoveryStage}</span>
+                    </div>
+                  )}
                 </div>
-                <h2 className="text-2xl font-semibold tracking-[-0.03em] text-white sm:text-[28px]">
-                  Lead generation, on autopilot.
-                </h2>
-                <p className="mt-1.5 text-sm text-slate-500">
-                  {leads.length > 0
-                    ? `Your AI engine has evaluated ${leads.length} prospects with ${highPriorityCount} high-intent opportunities.`
-                    : 'Ready to scan target business directories and score prospects.'}
-                </p>
+
+                {/* Form Controls */}
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-5 items-end">
+                  {/* Country Selector */}
+                  <div>
+                    <label className="block text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500 mb-1.5">
+                      Target Country
+                    </label>
+                    <select
+                      value={discCountry}
+                      onChange={(e) => setDiscCountry(e.target.value)}
+                      disabled={isDiscovering}
+                      className="h-9 w-full rounded-lg border border-white/[0.1] bg-[#121822] px-3 text-xs text-slate-200 focus:border-emerald-400 focus:outline-none"
+                    >
+                      {TARGET_COUNTRIES.map((c) => (
+                        <option key={c} value={c}>
+                          {c}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* City Input */}
+                  <div>
+                    <label className="block text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500 mb-1.5">
+                      City / Metro
+                    </label>
+                    <input
+                      type="text"
+                      value={discCity}
+                      onChange={(e) => setDiscCity(e.target.value)}
+                      disabled={isDiscovering}
+                      placeholder="e.g. New York, London"
+                      className="h-9 w-full rounded-lg border border-white/[0.1] bg-[#121822] px-3 text-xs text-slate-200 focus:border-emerald-400 focus:outline-none"
+                    />
+                  </div>
+
+                  {/* Industry Input / Selector */}
+                  <div>
+                    <label className="block text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500 mb-1.5">
+                      Industry / Niche
+                    </label>
+                    <select
+                      value={discIndustry}
+                      onChange={(e) => setDiscIndustry(e.target.value)}
+                      disabled={isDiscovering}
+                      className="h-9 w-full rounded-lg border border-white/[0.1] bg-[#121822] px-3 text-xs text-slate-200 focus:border-emerald-400 focus:outline-none"
+                    >
+                      {COMMON_INDUSTRIES.map((ind) => (
+                        <option key={ind} value={ind}>
+                          {ind}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Max Results */}
+                  <div>
+                    <label className="block text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500 mb-1.5">
+                      Max Results (1-100)
+                    </label>
+                    <input
+                      type="number"
+                      min={5}
+                      max={100}
+                      value={discLimit}
+                      onChange={(e) => setDiscLimit(Number(e.target.value))}
+                      disabled={isDiscovering}
+                      className="h-9 w-full rounded-lg border border-white/[0.1] bg-[#121822] px-3 text-xs text-slate-200 focus:border-emerald-400 focus:outline-none"
+                    />
+                  </div>
+
+                  {/* Trigger Button */}
+                  <div>
+                    <Button
+                      onClick={startAutonomousDiscovery}
+                      disabled={isDiscovering}
+                      className="h-9 w-full gap-2 rounded-lg bg-emerald-400 text-xs font-semibold text-[#07100d] hover:bg-emerald-300 disabled:opacity-50"
+                    >
+                      {isDiscovering ? (
+                        <>
+                          <Loader2 className="size-3.5 animate-spin" />
+                          Discovering...
+                        </>
+                      ) : (
+                        <>
+                          <Compass className="size-3.5" />
+                          Start Discovery
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                </div>
+
+                {/* Latest Discovery Stats Summary */}
+                {lastDiscoverySummary && (
+                  <div className="mt-2 flex flex-wrap items-center gap-4 rounded-lg border border-white/[0.05] bg-white/[0.02] px-4 py-2 text-[11px] text-slate-400">
+                    <span className="text-slate-200 font-medium">Session Output:</span>
+                    <span>Discovered: <strong className="text-white">{lastDiscoverySummary.total_discovered}</strong></span>
+                    <span>Websites Audited: <strong className="text-emerald-300">{lastDiscoverySummary.with_website_count}</strong></span>
+                    <span>No Website: <strong className="text-amber-300">{lastDiscoverySummary.without_website_count}</strong></span>
+                    <span>High Fit Opportunities: <strong className="text-violet-300">{lastDiscoverySummary.high_priority_count}</strong></span>
+                    <span>Duplicates Skipped: <strong className="text-sky-300">{lastDiscoverySummary.duplicates_skipped}</strong></span>
+                    <span>CRM Appended: <strong className="text-white">{lastDiscoverySummary.crm_synced}</strong></span>
+                  </div>
+                )}
               </div>
-              <div className="flex items-center gap-2 text-xs text-slate-500">
-                <span className="size-1.5 rounded-full bg-emerald-400" />
-                Last synced {lastSyncTime}
-              </div>
-            </div>
+            </Card>
 
             {/* Dynamic Metric Cards */}
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
               <MetricCard
                 icon={FileText}
-                label="Total scraped"
+                label="Total in CRM"
                 value={String(totalCount)}
-                detail="leads in CRM database"
+                detail="verified business prospects"
                 accent="emerald"
               />
               <MetricCard
                 icon={Target}
-                label="High priority"
+                label="High Priority Fit"
                 value={String(highPriorityCount)}
-                detail={`${highPercentage}% of qualified leads`}
+                detail={`${highPercentage}% qualified opportunities`}
                 accent="violet"
               />
               <MetricCard
-                icon={TrendingUp}
-                label="Efficiency gain"
-                value="90%"
-                detail="vs. manual prospecting"
+                icon={Globe2}
+                label="Web Presence Ratio"
+                value={totalCount > 0 ? `${Math.round((websitesFoundCount / totalCount) * 100)}%` : '0%'}
+                detail={`${websitesFoundCount} with site · ${websitesMissingCount} missing`}
                 accent="blue"
               />
               <MetricCard
                 icon={Bot}
-                label="Active AI agent"
+                label="AI Qualification Model"
                 value={agentModel.replace('models/', '')}
-                detail="Operational · Real-time scoring"
+                detail="OpenStreetMap + Gemini"
                 accent="amber"
                 compact
               />
@@ -548,18 +846,48 @@ export default function Page() {
               <div className="flex flex-col gap-4 border-b border-white/[0.07] px-5 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-6">
                 <div>
                   <div className="flex items-center gap-2">
-                    <h3 className="text-sm font-semibold text-slate-100">Live lead feed</h3>
-                    <Badge className="border-emerald-400/20 bg-emerald-400/10 text-[10px] font-medium text-emerald-300 hover:bg-emerald-400/10">
+                    <h3 className="text-sm font-semibold text-slate-100">
+                      {viewSource === 'discovery' ? 'Latest Discovery Session' : 'Google Sheets Live CRM Feed'}
+                    </h3>
+                    <Badge className="border-emerald-400/20 bg-emerald-400/10 text-[10px] font-medium text-emerald-300">
                       <span className="mr-1 size-1.5 rounded-full bg-emerald-400" />
-                      Live CRM
+                      Live Verified
                     </Badge>
                   </div>
                   <p className="mt-1 text-xs text-slate-500">
-                    AI-enriched prospects captured from target business directories
+                    {viewSource === 'discovery'
+                      ? 'Results from the most recent autonomous web discovery run'
+                      : 'Persistent CRM records synchronized with your Google Sheet'}
                   </p>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
+                  {/* View Mode Toggle */}
+                  {discoveryResults.length > 0 && (
+                    <div className="flex rounded-lg border border-white/[0.08] bg-white/[0.02] p-0.5 text-xs mr-2">
+                      <button
+                        onClick={() => setViewSource('crm')}
+                        className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                          viewSource === 'crm'
+                            ? 'bg-emerald-400/20 text-emerald-300'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        All CRM Leads ({leads.length})
+                      </button>
+                      <button
+                        onClick={() => setViewSource('discovery')}
+                        className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                          viewSource === 'discovery'
+                            ? 'bg-emerald-400/20 text-emerald-300'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Latest Batch ({discoveryResults.length})
+                      </button>
+                    </div>
+                  )}
+
                   {/* Priority Filter Pill */}
                   <div className="flex rounded-lg border border-white/[0.08] bg-white/[0.02] p-0.5 text-xs">
                     {(['All', 'High', 'Medium', 'Low'] as const).map((p) => (
@@ -595,19 +923,22 @@ export default function Page() {
                     <TableHeader>
                       <TableRow className="border-white/[0.07] hover:bg-transparent">
                         <TableHead className="whitespace-nowrap px-5 py-3 text-[10px] font-medium uppercase tracking-[0.15em] text-slate-600 sm:px-6">
-                          Captured
+                          Business & Location
                         </TableHead>
                         <TableHead className="whitespace-nowrap text-[10px] font-medium uppercase tracking-[0.15em] text-slate-600">
-                          Company
+                          Website & Audit
                         </TableHead>
                         <TableHead className="whitespace-nowrap text-[10px] font-medium uppercase tracking-[0.15em] text-slate-600">
-                          Email
+                          Contact Info
                         </TableHead>
                         <TableHead className="whitespace-nowrap text-[10px] font-medium uppercase tracking-[0.15em] text-slate-600">
-                          Priority
+                          Priority & Opportunity
                         </TableHead>
                         <TableHead className="min-w-[340px] whitespace-nowrap pr-5 text-[10px] font-medium uppercase tracking-[0.15em] text-slate-600 sm:pr-6">
-                          AI analysis & Observable Signals
+                          AI Reasoning & Technical Evidence
+                        </TableHead>
+                        <TableHead className="whitespace-nowrap text-[10px] font-medium uppercase tracking-[0.15em] text-slate-600">
+                          Source
                         </TableHead>
                       </TableRow>
                     </TableHeader>
@@ -615,44 +946,27 @@ export default function Page() {
                     <TableBody>
                       {loading ? (
                         <TableRow>
-                          <TableCell colSpan={5} className="py-12 text-center text-xs text-slate-500">
+                          <TableCell colSpan={6} className="py-12 text-center text-xs text-slate-500">
                             <div className="flex items-center justify-center gap-2">
                               <Loader2 className="size-4 animate-spin text-emerald-400" />
-                              <span>Loading live leads from Google Sheets...</span>
+                              <span>Loading live verified leads...</span>
                             </div>
                           </TableCell>
                         </TableRow>
                       ) : processedLeads.length === 0 ? (
                         <TableRow>
-                          <TableCell colSpan={5} className="py-12 text-center text-xs text-slate-500">
-                            {searchQuery || priorityFilter !== 'All' ? (
-                              <div>
-                                <p>No leads matching current search/filter criteria.</p>
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  onClick={() => {
-                                    setSearchQuery('')
-                                    setPriorityFilter('All')
-                                  }}
-                                  className="mt-2 text-xs text-emerald-300"
-                                >
-                                  Clear filters
-                                </Button>
-                              </div>
-                            ) : (
-                              <div>
-                                <p>No leads recorded yet.</p>
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={runAiScan}
-                                  className="mt-3 border-emerald-400/20 bg-emerald-400/10 text-xs text-emerald-300 hover:bg-emerald-400/20"
-                                >
-                                  <Sparkles className="mr-1.5 size-3.5" /> Run first scan
-                                </Button>
-                              </div>
-                            )}
+                          <TableCell colSpan={6} className="py-12 text-center text-xs text-slate-500">
+                            <div>
+                              <p>No leads matching current search/filter criteria.</p>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={startAutonomousDiscovery}
+                                className="mt-3 border-emerald-400/20 bg-emerald-400/10 text-xs text-emerald-300 hover:bg-emerald-400/20"
+                              >
+                                <Compass className="mr-1.5 size-3.5" /> Start new discovery
+                              </Button>
+                            </div>
                           </TableCell>
                         </TableRow>
                       ) : (
@@ -661,58 +975,121 @@ export default function Page() {
                             key={lead.id}
                             className="border-white/[0.06] transition-colors hover:bg-white/[0.025]"
                           >
-                            <TableCell className="whitespace-nowrap px-5 py-4 text-xs text-slate-500 sm:px-6">
-                              {lead.timestamp}
-                            </TableCell>
-
-                            <TableCell className="whitespace-nowrap">
+                            {/* Business & Location */}
+                            <TableCell className="whitespace-nowrap px-5 py-4 sm:px-6">
                               <div className="flex items-center gap-3">
                                 <div className="flex size-8 items-center justify-center rounded-lg border border-white/[0.08] bg-white/[0.04] text-[10px] font-semibold text-slate-300">
                                   {lead.initials}
                                 </div>
                                 <div>
                                   <span className="text-sm font-medium text-slate-200">{lead.company}</span>
-                                  {lead.website && (
-                                    <p className="text-[11px] text-slate-500 hover:text-slate-400">
-                                      <a href={lead.website} target="_blank" rel="noopener noreferrer">
-                                        {lead.website.replace(/^https?:\/\//, '')}
-                                      </a>
-                                    </p>
-                                  )}
+                                  <p className="flex items-center gap-1 text-[11px] text-slate-500">
+                                    <MapPin className="size-3 text-slate-600" />
+                                    {lead.city ? `${lead.city}, ` : ''}{lead.country} · <span className="text-slate-400">{lead.industry}</span>
+                                  </p>
                                 </div>
                               </div>
                             </TableCell>
 
+                            {/* Website & Audit status */}
+                            <TableCell className="whitespace-nowrap text-xs">
+                              {lead.website ? (
+                                <div className="flex flex-col gap-1">
+                                  <a
+                                    href={lead.website}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1 text-emerald-300 hover:underline max-w-[180px] truncate"
+                                  >
+                                    <Globe className="size-3 shrink-0" />
+                                    {lead.website.replace(/^https?:\/\/(www\.)?/, '')}
+                                    <ExternalLink className="size-2.5 opacity-60" />
+                                  </a>
+                                  <span
+                                    className={`inline-flex items-center gap-1 w-fit rounded px-1.5 py-0.5 text-[9px] font-medium uppercase ${
+                                      lead.websiteStatus === 'working'
+                                        ? 'bg-emerald-400/10 text-emerald-400 border border-emerald-400/20'
+                                        : lead.websiteStatus === 'broken'
+                                        ? 'bg-red-400/10 text-red-400 border border-red-400/20'
+                                        : 'bg-slate-400/10 text-slate-400'
+                                    }`}
+                                  >
+                                    {lead.websiteStatus}
+                                  </span>
+                                </div>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-300 border border-amber-400/20">
+                                  No Website
+                                </span>
+                              )}
+                            </TableCell>
+
+                            {/* Contact Info */}
                             <TableCell className="whitespace-nowrap text-xs text-slate-400">
-                              <span className="inline-flex items-center gap-2">
-                                <Mail className="size-3.5 text-slate-600" />
-                                {lead.email}
-                              </span>
+                              <div className="flex flex-col gap-1">
+                                {lead.phone && (
+                                  <span className="inline-flex items-center gap-1.5 text-[11px] text-slate-300">
+                                    <Phone className="size-3 text-slate-500" />
+                                    {lead.phone}
+                                  </span>
+                                )}
+                                {lead.email && (
+                                  <span className="inline-flex items-center gap-1.5 text-[11px] text-slate-400 truncate max-w-[160px]">
+                                    <Mail className="size-3 text-slate-500" />
+                                    {lead.email}
+                                  </span>
+                                )}
+                                {!lead.phone && !lead.email && (
+                                  <span className="text-[10px] text-slate-600">Via Directory</span>
+                                )}
+                              </div>
                             </TableCell>
 
-                            <TableCell>
-                              <Badge
-                                className={
-                                  lead.priority.toLowerCase() === 'high'
-                                    ? 'border-emerald-400/20 bg-emerald-400 text-[10px] font-semibold text-[#07100d] hover:bg-emerald-400'
-                                    : lead.priority.toLowerCase() === 'medium'
-                                    ? 'border-violet-400/20 bg-violet-400/15 text-[10px] font-medium text-violet-300 hover:bg-violet-400/20'
-                                    : 'border-white/[0.1] bg-white/[0.06] text-[10px] font-medium text-slate-400 hover:bg-white/[0.06]'
-                                }
-                              >
-                                {lead.priority}
-                              </Badge>
+                            {/* Priority & Opportunity Type */}
+                            <TableCell className="whitespace-nowrap">
+                              <div className="flex flex-col gap-1">
+                                <Badge
+                                  className={
+                                    lead.priority.toLowerCase() === 'high'
+                                      ? 'border-emerald-400/20 bg-emerald-400 text-[10px] font-semibold text-[#07100d]'
+                                      : lead.priority.toLowerCase() === 'medium'
+                                      ? 'border-violet-400/20 bg-violet-400/15 text-[10px] font-medium text-violet-300'
+                                      : 'border-white/[0.1] bg-white/[0.06] text-[10px] font-medium text-slate-400'
+                                  }
+                                >
+                                  {lead.priority} Priority
+                                </Badge>
+                                <span className="text-[10px] font-medium text-slate-400">
+                                  Opp: <strong className="text-slate-200">{lead.opportunityType}</strong>
+                                </span>
+                              </div>
                             </TableCell>
 
-                            <TableCell className="pr-5 text-xs leading-relaxed text-slate-400 sm:pr-6">
-                              <span
-                                className={`mr-2 inline-flex size-1.5 rounded-full align-middle ${
-                                  lead.priority.toLowerCase() === 'high'
-                                    ? 'bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.8)]'
-                                    : 'bg-slate-500'
-                                }`}
-                              />
-                              {lead.summary}
+                            {/* AI Reasoning & Evidence */}
+                            <TableCell className="pr-5 text-xs leading-relaxed text-slate-400 sm:pr-6 max-w-[360px]">
+                              <p className="line-clamp-2">{lead.summary}</p>
+                              {lead.evidence && (
+                                <p className="mt-1 text-[10px] text-slate-500 truncate">
+                                  <span className="text-slate-400">Signals:</span> {lead.evidence}
+                                </p>
+                              )}
+                            </TableCell>
+
+                            {/* Source Attribution Link */}
+                            <TableCell className="whitespace-nowrap text-xs">
+                              {lead.sourceUrl ? (
+                                <a
+                                  href={lead.sourceUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1 text-[10px] text-slate-500 hover:text-slate-300"
+                                >
+                                  <span>OSM</span>
+                                  <ExternalLink className="size-2.5" />
+                                </a>
+                              ) : (
+                                <span className="text-[10px] text-slate-600">Local</span>
+                              )}
                             </TableCell>
                           </TableRow>
                         ))
@@ -724,12 +1101,12 @@ export default function Page() {
 
               <div className="flex items-center justify-between border-t border-white/[0.07] px-5 py-3 text-[11px] text-slate-600 sm:px-6">
                 <span>
-                  Showing {processedLeads.length} of {leads.length} leads
-                  {priorityFilter !== 'All' && ` (${priorityFilter} priority only)`}
+                  Showing {processedLeads.length} of {activeDataset.length} leads
+                  {priorityFilter !== 'All' && ` (${priorityFilter} priority)`}
                 </span>
                 <span className="inline-flex items-center gap-2">
-                  <Users className="size-3.5" />
-                  CRM Sync Active
+                  <ShieldCheck className="size-3.5 text-emerald-400" />
+                  Verified OpenStreetMap Discovery
                 </span>
               </div>
             </Card>

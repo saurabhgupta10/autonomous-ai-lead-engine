@@ -29,6 +29,11 @@ import config
 from scraper import scrape_businesses
 from ai_filter import score_lead
 from sheet_manager import append_high_priority_leads, get_worksheet
+from discovery.discovery_schemas import DiscoveryQuery
+from discovery.discovery_service import DiscoveryService
+
+# ── Singleton discovery coordinator ──────────────────────────────────────────
+discovery_service = DiscoveryService()
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
@@ -308,3 +313,48 @@ def trigger_scan(body: ScanRequest):
 def scan_status():
     """Return the current (or last) scan status."""
     return _scan_status
+
+
+# ── Autonomous Business Discovery Endpoints (Phase 5) ─────────────────────────
+
+@app.post("/api/discovery/start", status_code=202, tags=["discovery"])
+def start_business_discovery(query: DiscoveryQuery):
+    """
+    Launch autonomous discovery of genuine businesses by location and industry.
+    Discovers via OpenStreetMap Overpass/Nominatim, conducts deep website audits,
+    scores opportunities with Gemini, and syncs high-fit leads to Google Sheets.
+    """
+    res = discovery_service.start_discovery(query)
+    if res.get("status") == "rejected":
+        raise HTTPException(
+            status_code=409,
+            detail={"error": res.get("error"), "session_id": res.get("session_id")},
+        )
+    return res
+
+
+@app.get("/api/discovery/status", tags=["discovery"])
+def get_discovery_status():
+    """Poll the real-time status of the current or latest discovery job."""
+    return discovery_service.get_status()
+
+
+@app.get("/api/discovery/results", tags=["discovery"])
+def get_discovery_results():
+    """Return the enriched business records discovered in the latest session."""
+    results = discovery_service.get_latest_results()
+    return {
+        "status": "ok",
+        "total_results": len(results),
+        "results": results,
+    }
+
+
+@app.get("/api/discovery/history", tags=["discovery"])
+def get_discovery_history():
+    """Return history log of recent discovery runs."""
+    return {
+        "status": "ok",
+        "history": discovery_service.get_history(),
+    }
+

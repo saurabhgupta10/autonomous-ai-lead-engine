@@ -1,14 +1,22 @@
 """
 sheet_manager.py
 ----------------
-Authenticate with a Google Cloud service account via gspread and append
-High-priority leads to a Google Sheet.
+Google Sheets CRM Database integration.
+
+Features:
+- Authenticates securely via service account credentials.
+- Persistent cross-scan deduplication using normalized domain and business name + city.
+- Non-destructive header migration ensuring backwards compatibility with existing CRM data.
+- Batch row appending to conserve Google API rate limits.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -19,13 +27,37 @@ from config import (
     GOOGLE_WORKSHEET_NAME,
 )
 
-# Spreadsheets API + Drive (needed to open a sheet shared with the service account).
+logger = logging.getLogger(__name__)
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-HEADER_ROW = [
+# Standard CRM Columns for Autonomous Discovery
+RICH_HEADER_ROW = [
+    "Timestamp (UTC)",
+    "Business Name",
+    "Country",
+    "City",
+    "Industry",
+    "Website",
+    "Email",
+    "Phone",
+    "Website Status",
+    "Opportunity Type",
+    "Priority",
+    "AI Score",
+    "AI Reasoning",
+    "Evidence",
+    "Source URL",
+    "Discovery Provider",
+    "Discovery Date",
+    "Last Updated",
+]
+
+# Legacy CRM columns for backwards compatibility
+LEGACY_HEADER_ROW = [
     "Timestamp (UTC)",
     "Company Name",
     "Website",
@@ -38,10 +70,7 @@ HEADER_ROW = [
 def get_client() -> gspread.Client:
     key_path = Path(GOOGLE_SERVICE_ACCOUNT_FILE)
     if not key_path.exists():
-        raise FileNotFoundError(
-            f"Service account JSON not found at {key_path}. "
-            "Follow the setup steps in README.md."
-        )
+        raise FileNotFoundError(f"Service account JSON not found at {key_path}.")
     creds = Credentials.from_service_account_file(str(key_path), scopes=SCOPES)
     return gspread.authorize(creds)
 
@@ -55,9 +84,7 @@ def get_worksheet(
     worksheet_name = worksheet_name or GOOGLE_WORKSHEET_NAME
 
     if not sheet_id:
-        raise RuntimeError(
-            "GOOGLE_SHEET_ID is missing. Copy .env.example to .env and set it."
-        )
+        raise RuntimeError("GOOGLE_SHEET_ID is missing from .env configuration.")
 
     client = client or get_client()
     spreadsheet = client.open_by_key(sheet_id)
@@ -66,41 +93,180 @@ def get_worksheet(
         worksheet = spreadsheet.worksheet(worksheet_name)
     except gspread.WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(
-            title=worksheet_name, rows=1000, cols=len(HEADER_ROW)
+            title=worksheet_name, rows=1000, cols=len(RICH_HEADER_ROW)
         )
 
     _ensure_header(worksheet)
     return worksheet
 
 
+def _ensure_header(worksheet: gspread.Worksheet) -> list[str]:
+    """Ensure headers exist and non-destructively upgrade if legacy."""
+    existing = worksheet.row_values(1)
+    if not existing:
+        worksheet.append_row(RICH_HEADER_ROW, value_input_option="USER_ENTERED")
+        return RICH_HEADER_ROW
+
+    # If already rich header
+    if "Business Name" in existing or "Industry" in existing:
+        return existing
+
+    # Non-destructive upgrade: Append missing rich columns to row 1
+    missing_cols = [col for col in RICH_HEADER_ROW if col not in existing]
+    if missing_cols:
+        logger.info("Migrating Google Sheets headers to support discovery fields: +%s", missing_cols)
+        new_headers = existing + missing_cols
+        # Update row 1 with expanded headers
+        worksheet.update(values=[new_headers], range_name=f"A1:{chr(64 + len(new_headers))}1")
+        return new_headers
+
+    return existing
+
+
+def normalize_domain(url: str | None) -> str:
+    """Extract clean domain for duplicate prevention."""
+    if not url:
+        return ""
+    clean = url.strip().lower()
+    if not clean.startswith(("http://", "https://")):
+        clean = f"https://{clean}"
+    try:
+        netloc = urlparse(clean).netloc
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc
+    except Exception:
+        return ""
+
+
+def normalize_business_key(name: str, city: str) -> str:
+    """Generate normalized business identity key."""
+    clean_name = "".join(c for c in name.lower() if c.isalnum() or c.isspace()).strip()
+    clean_city = "".join(c for c in city.lower() if c.isalnum() or c.isspace()).strip()
+    return f"{clean_name}|{clean_city}"
+
+
+def get_existing_crm_identifiers(worksheet: gspread.Worksheet) -> tuple[set[str], set[str], set[str]]:
+    """
+    Extract existing domain, business keys, and provider IDs from CRM in 1 batch read.
+    Returns: (domains_set, business_keys_set, source_urls_set)
+    """
+    try:
+        records = worksheet.get_all_records()
+    except Exception as exc:
+        logger.warning("Could not read existing CRM rows: %s", exc)
+        return set(), set(), set()
+
+    existing_domains: set[str] = set()
+    existing_keys: set[str] = set()
+    existing_sources: set[str] = set()
+
+    for r in records:
+        website = r.get("Website") or r.get("website") or ""
+        dom = normalize_domain(website)
+        if dom and "example.com" not in dom:
+            existing_domains.add(dom)
+
+        name = r.get("Business Name") or r.get("Company Name") or r.get("company_name") or ""
+        city = r.get("City") or r.get("city") or ""
+        if name:
+            existing_keys.add(normalize_business_key(name, city))
+
+        src = r.get("Source URL") or r.get("source_url") or ""
+        if src:
+            existing_sources.add(src.strip().lower())
+
+    return existing_domains, existing_keys, existing_sources
+
+
+def sync_discovered_leads_to_sheets(records: list[Any]) -> tuple[int, int]:
+    """
+    Store newly discovered leads with persistent deduplication.
+    Returns: (appended_count, duplicates_skipped)
+    """
+    if not records:
+        return 0, 0
+
+    worksheet = get_worksheet()
+    existing_headers = _ensure_header(worksheet)
+    existing_domains, existing_keys, existing_sources = get_existing_crm_identifiers(worksheet)
+
+    to_append: list[list[str]] = []
+    duplicates_skipped = 0
+
+    for rec in records:
+        crm_dict = rec.to_crm_dict() if hasattr(rec, "to_crm_dict") else rec
+
+        website = crm_dict.get("Website", "")
+        domain = normalize_domain(website)
+        name = crm_dict.get("Business Name") or crm_dict.get("Company Name", "")
+        city = crm_dict.get("City", "")
+        bkey = normalize_business_key(name, city)
+        source_url = crm_dict.get("Source URL", "").strip().lower()
+
+        # Check duplicate
+        is_dup = False
+        if domain and domain in existing_domains:
+            is_dup = True
+        elif bkey and bkey in existing_keys:
+            is_dup = True
+        elif source_url and source_url in existing_sources:
+            is_dup = True
+
+        if is_dup:
+            duplicates_skipped += 1
+            continue
+
+        # Add to local seen sets
+        if domain:
+            existing_domains.add(domain)
+        if bkey:
+            existing_keys.add(bkey)
+        if source_url:
+            existing_sources.add(source_url)
+
+        # Map to current worksheet column order
+        row = [str(crm_dict.get(col, "")) for col in existing_headers]
+        to_append.append(row)
+
+    if to_append:
+        worksheet.append_rows(to_append, value_input_option="USER_ENTERED")
+        logger.info("Successfully appended %d new leads (%d duplicates skipped).", len(to_append), duplicates_skipped)
+
+    return len(to_append), duplicates_skipped
+
+
+# ── Legacy Scraper Pipeline Compatibility ─────────────────────────────────────
+
 def append_high_priority_leads(leads: list[dict]) -> int:
-    """
-    Append only High-priority leads. Returns how many rows were written.
-    """
+    """Legacy helper: appends High priority leads from URL scraper."""
     high_leads = [lead for lead in leads if lead.get("priority") == "High"]
     if not high_leads:
         return 0
 
     worksheet = get_worksheet()
-    rows = [_lead_to_row(lead) for lead in high_leads]
+    headers = worksheet.row_values(1)
+
+    rows = []
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    for lead in high_leads:
+        lead_dict = {
+            "Timestamp (UTC)": timestamp,
+            "Business Name": lead.get("company_name", ""),
+            "Company Name": lead.get("company_name", ""),
+            "Website": lead.get("website", ""),
+            "Email": lead.get("email", ""),
+            "Priority": lead.get("priority", "High"),
+            "Reason": lead.get("reason", ""),
+            "AI Reasoning": lead.get("reason", ""),
+            "Source URL": lead.get("source_url", "Local Directory Scraper"),
+            "Discovery Provider": "local_scraper",
+            "Discovery Date": timestamp[:10],
+            "Last Updated": timestamp,
+        }
+        row = [str(lead_dict.get(h, "")) for h in headers]
+        rows.append(row)
+
     worksheet.append_rows(rows, value_input_option="USER_ENTERED")
     return len(rows)
-
-
-def _ensure_header(worksheet) -> None:
-    existing = worksheet.row_values(1)
-    if existing:
-        return
-    worksheet.append_row(HEADER_ROW, value_input_option="USER_ENTERED")
-
-
-def _lead_to_row(lead: dict) -> list[str]:
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    return [
-        timestamp,
-        lead.get("company_name", ""),
-        lead.get("website", ""),
-        lead.get("email", ""),
-        lead.get("priority", ""),
-        lead.get("reason", ""),
-    ]

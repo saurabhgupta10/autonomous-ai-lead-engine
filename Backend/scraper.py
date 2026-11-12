@@ -37,6 +37,8 @@ def scrape_businesses(urls: Iterable[str]) -> list[dict]:
     for url in urls:
         html = _load_html(url)
         for row in _parse_directory(html):
+            row["source_url"] = str(url)
+            row["discovery_provider"] = "local_directory_scraper"
             key = (row["company_name"].lower(), row["email"].lower())
             if key in seen:
                 continue
