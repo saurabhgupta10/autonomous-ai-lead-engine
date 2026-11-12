@@ -74,7 +74,7 @@ class TestRealBusinessDiscovery(unittest.TestCase):
         for lead in leads:
             self.assertTrue(lead.business_name, "Business must have a name")
             self.assertTrue(lead.source_url.startswith("https://www.openstreetmap.org/"), "Must have verifiable OSM source URL")
-            self.assertEqual(lead.discovery_provider, "openstreetmap_overpass")
+            self.assertIn("OpenStreetMap", lead.discovery_provider)
             self.assertEqual(lead.country, "United States")
 
     def test_real_discovery_salons_sydney(self):

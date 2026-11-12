@@ -1099,15 +1099,30 @@ export default function Page() {
                 </div>
               </CardContent>
 
-              <div className="flex items-center justify-between border-t border-white/[0.07] px-5 py-3 text-[11px] text-slate-600 sm:px-6">
+              <div className="flex flex-col gap-2 border-t border-white/[0.07] px-5 py-3 text-[11px] text-slate-500 sm:flex-row sm:items-center sm:justify-between sm:px-6">
                 <span>
                   Showing {processedLeads.length} of {activeDataset.length} leads
                   {priorityFilter !== 'All' && ` (${priorityFilter} priority)`}
                 </span>
-                <span className="inline-flex items-center gap-2">
-                  <ShieldCheck className="size-3.5 text-emerald-400" />
-                  Verified OpenStreetMap Discovery
-                </span>
+                <div className="flex items-center gap-4 text-[11px]">
+                  <span className="inline-flex items-center gap-1.5 text-slate-400">
+                    <ShieldCheck className="size-3.5 text-emerald-400" />
+                    Autonomous Web Intelligence
+                  </span>
+                  <span className="text-slate-600">|</span>
+                  <span>
+                    Map data ©{' '}
+                    <a
+                      href="https://www.openstreetmap.org/copyright"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-slate-400 underline decoration-slate-600 underline-offset-2 hover:text-emerald-400"
+                    >
+                      OpenStreetMap contributors
+                    </a>{' '}
+                    (ODbL)
+                  </span>
+                </div>
               </div>
             </Card>
           </div>

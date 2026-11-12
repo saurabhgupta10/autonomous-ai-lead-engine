@@ -18,3 +18,10 @@ Frontend/pnpm-lock.yaml
 # Block Editor configurations
 .idea/
 .vscode/
+*.lnk
+Frontend/tsconfig.tsbuildinfo
+
+# Runtime discovery session data and cache
+Backend/data/cache/
+Backend/data/discovery_sessions/
+Backend/acceptance_results.json

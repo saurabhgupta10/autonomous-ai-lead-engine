@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./Backend
+      dockerfile: Dockerfile
+    container_name: lead-engine-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-flash-lite-latest}
+      - SPREADSHEET_ID=${SPREADSHEET_ID}
+      - SERVICE_ACCOUNT_FILE=/app/credentials/service_account.json
+      - API_BEARER_TOKEN=${API_BEARER_TOKEN:-}
+      - ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+      - OSM_USER_AGENT=AutonomousLeadEngine/2.0
+      - OSM_CONTACT_EMAIL=${OSM_CONTACT_EMAIL:-contact@example.com}
+    volumes:
+      - ./Backend/credentials:/app/credentials:ro
+      - ./Backend/data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./Frontend
+      dockerfile: Dockerfile
+    container_name: lead-engine-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      backend:
+        condition: service_healthy
