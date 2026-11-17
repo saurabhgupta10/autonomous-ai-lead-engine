@@ -18,6 +18,12 @@ class DiscoveryQuery(BaseModel):
     keyword: Optional[str] = Field(None, description="Optional search keyword to refine the query")
     limit: int = Field(25, ge=1, le=100, description="Maximum number of business records to discover (1-100)")
 
+    def __init__(self, **data: Any):
+        # Support max_results as an alias for limit
+        if "max_results" in data and "limit" not in data:
+            data["limit"] = data.pop("max_results")
+        super().__init__(**data)
+
     @field_validator("country", "city", "industry", mode="before")
     @classmethod
     def strip_strings(cls, v: Any) -> str:
@@ -36,8 +42,9 @@ class BusinessRecord(BaseModel):
     longitude: Optional[float] = None
     website: Optional[str] = None
     email: Optional[str] = None
+    email_source: Optional[str] = None
     phone: Optional[str] = None
-    discovery_provider: str = "openstreetmap_overpass"
+    discovery_provider: str = "OpenStreetMap (ODbL)"
     source_url: str
     discovery_timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -46,6 +53,7 @@ class BusinessRecord(BaseModel):
     ai_evaluation: Optional[dict[str, Any]] = None
     priority: str = "Medium"
     reason: str = ""
+    is_ai_qualified: bool = False
 
     def to_crm_dict(self) -> dict[str, Any]:
         """Convert to dict matching CRM sheet storage requirements."""

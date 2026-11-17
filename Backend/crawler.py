@@ -23,6 +23,13 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+from email_extractor import (
+    clean_and_validate_email,
+    discover_contact_links,
+    extract_emails_from_html,
+    prioritize_lead_email,
+)
+
 logger = logging.getLogger(__name__)
 
 # Security parameters
@@ -136,6 +143,9 @@ def audit_website(url: str | None) -> dict[str, Any]:
             "ecommerce_signals": False,
             "observations": ["No discoverable website URL registered."],
             "analysis_status": "completed",
+            "emails_found": [],
+            "primary_email": None,
+            "email_source": None,
         }
 
     clean_url = url.strip()
@@ -175,6 +185,9 @@ def audit_website(url: str | None) -> dict[str, Any]:
                     "ecommerce_signals": False,
                     "observations": [f"SSRF guard blocked request to {current_url}: {reason}"],
                     "analysis_status": "failed",
+                    "emails_found": [],
+                    "primary_email": None,
+                    "email_source": None,
                 }
 
             resp = session.get(
@@ -209,6 +222,9 @@ def audit_website(url: str | None) -> dict[str, Any]:
                 "ecommerce_signals": False,
                 "observations": ["Exceeded maximum redirects (potential redirect loop)."],
                 "analysis_status": "completed",
+                "emails_found": [],
+                "primary_email": None,
+                "email_source": None,
             }
 
         with final_response as response:
@@ -226,6 +242,9 @@ def audit_website(url: str | None) -> dict[str, Any]:
                     "ecommerce_signals": False,
                     "observations": observations,
                     "analysis_status": "completed",
+                    "emails_found": [],
+                    "primary_email": None,
+                    "email_source": None,
                 }
 
             https_enabled = response.url.startswith("https://")
@@ -307,6 +326,57 @@ def audit_website(url: str | None) -> dict[str, Any]:
                 observations.append(f"E-commerce / checkout integration detected ({sig}).")
                 break
 
+        # ── Public Business Email Extraction ─────────────────────────────────
+        candidate_emails: list[dict[str, str]] = extract_emails_from_html(raw_html, "homepage")
+
+        # Inspect Contact / About subpages (up to 2 subpages to respect performance & bandwidth)
+        contact_urls = discover_contact_links(clean_url, raw_html, max_links=2)
+        for c_url in contact_urls:
+            is_c_safe, _ = is_ssrf_safe_url(c_url)
+            if not is_c_safe:
+                continue
+            try:
+                sub_resp = session.get(
+                    c_url,
+                    headers=headers,
+                    timeout=4,
+                    stream=True,
+                    allow_redirects=False,
+                )
+                if sub_resp.status_code == 200:
+                    sub_chunks = []
+                    sub_read = 0
+                    for chunk in sub_resp.iter_content(chunk_size=16384):
+                        sub_read += len(chunk)
+                        sub_chunks.append(chunk)
+                        if sub_read > MAX_CONTENT_BYTES:
+                            break
+                    sub_html = b"".join(sub_chunks).decode("utf-8", errors="replace")
+                    sub_emails = extract_emails_from_html(sub_html, "contact_page")
+                    candidate_emails.extend(sub_emails)
+
+                    # Secondary check for contact forms on dedicated contact page
+                    if not contact_form_found:
+                        sub_soup = BeautifulSoup(sub_html, "html.parser")
+                        for s_form in sub_soup.find_all("form"):
+                            s_inputs = s_form.find_all(["input", "textarea", "button"])
+                            s_has_submit = s_form.find(["button", "input"], attrs={"type": re.compile(r"submit", re.I)})
+                            s_has_fields = any(inp.name == "textarea" or inp.get("type") in {"text", "email"} for inp in s_inputs)
+                            if s_has_submit or s_has_fields:
+                                contact_form_found = True
+                                observations.append("Interactive contact form discovered on dedicated contact page.")
+                                break
+            except Exception as sub_err:
+                logger.debug("Contact subpage crawl error for %s: %s", c_url, sub_err)
+
+        primary_email, email_source = prioritize_lead_email(candidate_emails, clean_url)
+        unique_emails = list(dict.fromkeys(e["email"] for e in candidate_emails if e.get("email")))
+
+        if primary_email:
+            observations.append(f"Public business email identified: {primary_email} ({email_source}).")
+        else:
+            observations.append("No public business email found on homepage or contact pages.")
+
         return {
             "website_status": "working",
             "https_enabled": https_enabled,
@@ -319,6 +389,9 @@ def audit_website(url: str | None) -> dict[str, Any]:
             "ecommerce_signals": ecommerce_signals,
             "observations": observations,
             "analysis_status": "completed",
+            "emails_found": unique_emails,
+            "primary_email": primary_email,
+            "email_source": email_source,
         }
 
     except requests.exceptions.Timeout:
@@ -335,6 +408,9 @@ def audit_website(url: str | None) -> dict[str, Any]:
             "ecommerce_signals": False,
             "observations": observations,
             "analysis_status": "completed",
+            "emails_found": [],
+            "primary_email": None,
+            "email_source": None,
         }
     except Exception as exc:
         observations.append(f"Crawl error: {type(exc).__name__} - {str(exc)[:100]}")
@@ -350,4 +426,7 @@ def audit_website(url: str | None) -> dict[str, Any]:
             "ecommerce_signals": False,
             "observations": observations,
             "analysis_status": "failed",
+            "emails_found": [],
+            "primary_email": None,
+            "email_source": None,
         }

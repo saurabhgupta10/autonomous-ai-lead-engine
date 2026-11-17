@@ -16,17 +16,27 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 # ── Gemini ───────────────────────────────────────────────────────────────────
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-# Default model: gemini-flash-lite-latest or gemini-3.5-flash-lite (high availability & speed).
-# Override with GEMINI_MODEL=<model-name> in .env if needed.
+# Default model: gemini-flash-lite-latest (high availability & verified support).
+# Fallback models are automatically tried if configured model encounters rate limits or deprecation.
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
-GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
+GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "") or os.getenv("SPREADSHEET_ID", "")
 GOOGLE_WORKSHEET_NAME: str = os.getenv("GOOGLE_WORKSHEET_NAME", "Leads")
-GOOGLE_SERVICE_ACCOUNT_FILE: str = os.getenv(
+
+_raw_sa_file = os.getenv(
     "GOOGLE_SERVICE_ACCOUNT_FILE",
-    str(PROJECT_ROOT / "credentials" / "service_account.json"),
+    os.getenv("SERVICE_ACCOUNT_FILE", "credentials/service_account.json"),
 )
+_sa_path = Path(_raw_sa_file)
+if not _sa_path.is_absolute():
+    if (PROJECT_ROOT / _sa_path).exists():
+        _sa_path = PROJECT_ROOT / _sa_path
+    elif (PROJECT_ROOT.parent / _sa_path).exists():
+        _sa_path = PROJECT_ROOT.parent / _sa_path
+    else:
+        _sa_path = PROJECT_ROOT / "credentials" / "service_account.json"
+GOOGLE_SERVICE_ACCOUNT_FILE: str = str(_sa_path)
 
 # ── Scraper ───────────────────────────────────────────────────────────────────
 # Default local mock page used when no URLs are passed on the CLI.

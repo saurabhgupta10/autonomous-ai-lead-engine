@@ -6,12 +6,16 @@ Score raw scraped leads and qualify discovered businesses using the Gemini API.
 Strictly separates observed facts (from crawler.py and OpenStreetMap) from AI-generated
 service recommendations. A "High" score denotes strong technical/operational upside
 for outreach, NOT that the business has expressed buying intent.
+
+If Gemini API is unavailable or returns an error, evaluations are clearly marked as
+[Heuristic Fallback] so human operators and systems are never misled.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from google import genai
@@ -21,8 +25,49 @@ from audit import audit_lead_signals
 
 logger = logging.getLogger(__name__)
 
+# Prioritized list of compatible Gemini models to try in case of temporary provider spike/deprecation
+GEMINI_CANDIDATE_MODELS = [
+    config.GEMINI_MODEL,
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-flash-latest",
+]
 
-# ── Discovered Business Qualification (Phase 5) ───────────────────────────────
+
+def _get_unique_models() -> list[str]:
+    seen: set[str] = set()
+    models: list[str] = []
+    for m in GEMINI_CANDIDATE_MODELS:
+        clean = (m or "").strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            models.append(clean)
+    return models
+
+
+def _parse_gemini_json_array(text: str) -> list[dict[str, Any]]:
+    """Robustly extract and parse a JSON array from raw model text output."""
+    clean = text.strip()
+    if "```" in clean:
+        match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", clean, re.DOTALL)
+        if match:
+            clean = match.group(1).strip()
+        else:
+            clean = re.sub(r"^```(?:json)?", "", clean).strip()
+            clean = re.sub(r"```$", "", clean).strip()
+
+    if not clean.startswith("["):
+        start_idx = clean.find("[")
+        end_idx = clean.rfind("]")
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            clean = clean[start_idx : end_idx + 1]
+
+    return json.loads(clean)
+
+
+# ── Discovered Business Qualification ─────────────────────────────────────────
 
 def evaluate_discovered_leads(records: list[Any]) -> list[Any]:
     """
@@ -46,16 +91,40 @@ def evaluate_discovered_leads(records: list[Any]) -> list[Any]:
             _assign_heuristic_opportunity(r)
         return records
 
-    try:
-        return _evaluate_discovery_batch(client, records)
-    except Exception as exc:
-        logger.warning("Gemini batch qualification failed: %s. Using heuristic evaluation.", exc)
-        for r in records:
-            _assign_heuristic_opportunity(r)
-        return records
+    # Process in sub-batches of 15 records to guarantee prompt bounds and avoid output truncation
+    CHUNK_SIZE = 15
+    chunks = [records[i : i + CHUNK_SIZE] for i in range(0, len(records), CHUNK_SIZE)]
+
+    for chunk_idx, chunk in enumerate(chunks):
+        chunk_evaluated = False
+        for model_name in _get_unique_models():
+            try:
+                logger.info(
+                    "Evaluating discovery chunk %d/%d (%d leads) with Gemini model '%s'...",
+                    chunk_idx + 1, len(chunks), len(chunk), model_name
+                )
+                _evaluate_discovery_batch(client, chunk, model_name)
+                chunk_evaluated = True
+                break
+            except Exception as exc:
+                logger.warning(
+                    "Gemini qualification chunk %d with model '%s' failed: %s",
+                    chunk_idx + 1, model_name, exc
+                )
+                continue
+
+        if not chunk_evaluated:
+            logger.warning(
+                "All Gemini candidate models failed for chunk %d. Applying clearly marked heuristic fallback.",
+                chunk_idx + 1
+            )
+            for r in chunk:
+                _assign_heuristic_opportunity(r)
+
+    return records
 
 
-def _evaluate_discovery_batch(client: genai.Client, records: list[Any]) -> list[Any]:
+def _evaluate_discovery_batch(client: genai.Client, records: list[Any], model_name: str) -> list[Any]:
     """Evaluate batch of discovered businesses with Gemini in a single prompt."""
     payload = []
     for idx, r in enumerate(records):
@@ -114,26 +183,21 @@ Output ONLY raw JSON. No markdown code blocks, no backticks.
 """
 
     response = client.models.generate_content(
-        model=config.GEMINI_MODEL,
+        model=model_name,
         contents=prompt,
     )
 
-    clean_text = (
-        response.text.strip()
-        .removeprefix("```json")
-        .removeprefix("```")
-        .removesuffix("```")
-        .strip()
-    )
-
-    results = json.loads(clean_text)
+    results = _parse_gemini_json_array(response.text)
     by_idx = {item["index"]: item for item in results if "index" in item}
 
     for idx, r in enumerate(records):
         data = by_idx.get(idx)
         if data:
             r.priority = data.get("priority", "Medium")
-            r.reason = "[AI assessment] " + data.get("reason", "Qualified based on observable technical gaps.")
+            r.reason = f"[Gemini AI - {model_name}] " + data.get("reason", "Qualified based on observable technical gaps.")
+            r.is_ai_qualified = True
+            data["is_heuristic_fallback"] = False
+            data["evaluation_source"] = f"gemini_{model_name}"
             r.ai_evaluation = data
         else:
             _assign_heuristic_opportunity(r)
@@ -153,7 +217,7 @@ def _assign_heuristic_opportunity(record: Any) -> None:
         opp = "Website"
         rec = "Modern Business Website & Online Footprint"
         reason = "Established business without a discoverable website, missing inbound organic traffic."
-        evidence = ["No website found in business registry", "Direct phone available for outreach"]
+        evidence = ["No website found in business registry", "Direct contact channel available for outreach"]
     elif audit.get("website_status") == "broken":
         priority = "High"
         score = 90
@@ -161,7 +225,7 @@ def _assign_heuristic_opportunity(record: Any) -> None:
         rec = "Website Restoration & Performance Optimization"
         reason = "Registered website is currently broken or returning HTTP errors."
         evidence = ["Website unreachable or returned HTTP error"]
-    elif not audit.get("booking_functionality_found") and any(k in category for k in ["restaurant", "cafe", "salon", "hair", "dentist", "clinic", "spa"]):
+    elif not audit.get("booking_functionality_found") and any(k in category for k in ["restaurant", "cafe", "salon", "hair", "dentist", "clinic", "spa", "fitness", "gym"]):
         priority = "High"
         score = 88
         opp = "Booking"
@@ -191,7 +255,8 @@ def _assign_heuristic_opportunity(record: Any) -> None:
         evidence = ["Working website with existing contact channels"]
 
     record.priority = priority
-    record.reason = f"[System assessment] {reason}"
+    record.reason = f"[Heuristic Fallback] {reason}"
+    record.is_ai_qualified = False
     record.ai_evaluation = {
         "priority": priority,
         "score": score,
@@ -200,6 +265,8 @@ def _assign_heuristic_opportunity(record: Any) -> None:
         "reason": reason,
         "evidence": evidence,
         "confidence": 0.85,
+        "is_heuristic_fallback": True,
+        "evaluation_source": "heuristic_fallback",
     }
 
 
@@ -216,18 +283,29 @@ def score_lead(leads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not config.gemini_configured():
         for lead in leads:
             lead["priority"] = "Unscored"
-            lead["reason"] = "AI scoring skipped: GEMINI_API_KEY not configured."
+            lead["reason"] = "[Heuristic Fallback] AI scoring skipped: GEMINI_API_KEY not configured."
         return leads
 
     try:
         client = genai.Client(api_key=config.GEMINI_API_KEY)
-        return _score_batch(client, leads)
     except Exception as exc:
-        logger.warning("Scraper batch scoring failed (%s), using sequential.", exc)
-        return _score_sequential(client, leads)
+        logger.warning("Gemini client initialization failed: %s", exc)
+        for lead in leads:
+            lead["priority"] = "Medium"
+            lead["reason"] = f"[Heuristic Fallback] Client initialization failed: {exc}"
+        return leads
+
+    for model_name in _get_unique_models():
+        try:
+            return _score_batch(client, leads, model_name)
+        except Exception as exc:
+            logger.warning("Scraper scoring with model '%s' failed: %s", model_name, exc)
+            continue
+
+    return _score_sequential(client, leads)
 
 
-def _score_batch(client: genai.Client, leads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _score_batch(client: genai.Client, leads: list[dict[str, Any]], model_name: str) -> list[dict[str, Any]]:
     payload = []
     for idx, lead in enumerate(leads):
         audit = lead.get("audit", {})
@@ -257,27 +335,20 @@ Return JSON array:
 Output ONLY raw JSON.
 """
     response = client.models.generate_content(
-        model=config.GEMINI_MODEL,
+        model=model_name,
         contents=prompt,
     )
-    clean_text = (
-        response.text.strip()
-        .removeprefix("```json")
-        .removeprefix("```")
-        .removesuffix("```")
-        .strip()
-    )
-    results = json.loads(clean_text)
+    results = _parse_gemini_json_array(response.text)
     by_idx = {item["index"]: item for item in results if "index" in item}
 
     for idx, lead in enumerate(leads):
         score_data = by_idx.get(idx)
         if score_data:
             lead["priority"] = score_data.get("priority", "Medium")
-            lead["reason"] = "[AI assessment] " + score_data.get("reason", "Analyzed by AI engine.")
+            lead["reason"] = f"[Gemini AI - {model_name}] " + score_data.get("reason", "Analyzed by AI engine.")
         else:
             lead["priority"] = "Medium"
-            lead["reason"] = "[AI assessment] Automation fit evaluated based on business signals."
+            lead["reason"] = f"[Gemini AI - {model_name}] Automation fit evaluated based on business signals."
 
     return leads
 
@@ -285,5 +356,5 @@ Output ONLY raw JSON.
 def _score_sequential(client: genai.Client, leads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for lead in leads:
         lead["priority"] = "Medium"
-        lead["reason"] = "[AI assessment] Qualified based on observable operational signals."
+        lead["reason"] = "[Heuristic Fallback] Qualified based on observable operational signals."
     return leads

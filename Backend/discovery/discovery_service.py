@@ -25,6 +25,7 @@ import config
 from crawler import audit_website
 from discovery.discovery_schemas import BusinessRecord, DiscoveryQuery
 from discovery.overpass_provider import OverpassDiscoveryProvider
+from email_extractor import clean_and_validate_email
 
 logger = logging.getLogger(__name__)
 
@@ -125,19 +126,48 @@ class DiscoveryService:
                 )
                 return
 
-            # Stage 2: Deep Technical Website Audit
-            logger.info("[discovery:%s] Stage 2: Deep website crawling & security auditing...", session_id)
+            # Stage 2: Deep Technical Website Audit & Email Extraction
+            logger.info("[discovery:%s] Stage 2: Deep website crawling, technical audit & email extraction...", session_id)
             self._current_job["summary"]["stage"] = "auditing_websites"
 
             with_site = 0
             without_site = 0
+            emails_extracted_count = 0
+
             for lead in raw_leads:
                 if lead.website:
                     with_site += 1
-                    lead.website_audit = audit_website(lead.website)
+                    audit_res = audit_website(lead.website)
+                    lead.website_audit = audit_res
+
+                    extracted_email = audit_res.get("primary_email")
+                    valid_osm_email = clean_and_validate_email(lead.email) if lead.email else None
+
+                    if valid_osm_email:
+                        lead.email = valid_osm_email
+                        lead.email_source = getattr(lead, "email_source", None) or "openstreetmap_registry"
+                        emails_extracted_count += 1
+                    elif extracted_email:
+                        lead.email = extracted_email
+                        lead.email_source = audit_res.get("email_source")
+                        emails_extracted_count += 1
+                    else:
+                        lead.email = None
                 else:
                     without_site += 1
                     lead.website_audit = audit_website(None)
+                    valid_osm_email = clean_and_validate_email(lead.email) if lead.email else None
+                    if valid_osm_email:
+                        lead.email = valid_osm_email
+                        lead.email_source = "openstreetmap_registry"
+                        emails_extracted_count += 1
+                    else:
+                        lead.email = None
+
+            logger.info(
+                "[discovery:%s] Audited %d sites. Total leads with verified emails: %d",
+                session_id, with_site, emails_extracted_count
+            )
 
             # Stage 3: AI Opportunity Qualification with Gemini
             logger.info("[discovery:%s] Stage 3: Gemini AI Opportunity Qualification...", session_id)
@@ -164,18 +194,30 @@ class DiscoveryService:
             except Exception as save_err:
                 logger.warning("[discovery:%s] Failed to save session locally: %s", session_id, save_err)
 
-            # Stage 5: CRM Sync with Deduplication & Graceful Fallback
-            logger.info("[discovery:%s] Stage 5: Google Sheets CRM Sync & Deduplication...", session_id)
+            # Stage 5: CRM Sync with Deduplication & Insert/Update Upsert
+            logger.info("[discovery:%s] Stage 5: Google Sheets CRM Sync & Upsert...", session_id)
             self._current_job["summary"]["stage"] = "crm_sync"
 
             synced_count = 0
             dups_skipped = 0
+            records_inserted = 0
+            records_updated = 0
+            records_failed = 0
+            emails_added = 0
+            emails_updated = 0
             crm_status_note = "synced"
 
             if config.sheets_configured():
                 try:
                     from sheet_manager import sync_discovered_leads_to_sheets
-                    synced_count, dups_skipped = sync_discovered_leads_to_sheets(scored_leads)
+                    stats = sync_discovered_leads_to_sheets(scored_leads)
+                    records_inserted = stats.get("records_inserted", 0)
+                    records_updated = stats.get("records_updated", 0)
+                    dups_skipped = stats.get("duplicates_skipped", 0)
+                    records_failed = stats.get("records_failed", 0)
+                    emails_added = stats.get("emails_added", 0)
+                    emails_updated = stats.get("emails_updated", 0)
+                    synced_count = records_inserted + records_updated
                 except Exception as sheet_err:
                     logger.warning("[discovery:%s] Google Sheets sync failed: %s (results preserved locally)", session_id, sheet_err)
                     crm_status_note = f"CRM sync deferred: {sheet_err}"
@@ -189,6 +231,11 @@ class DiscoveryService:
                 "high_priority_count": high_count,
                 "duplicates_skipped": dups_skipped,
                 "crm_synced": synced_count,
+                "records_inserted": records_inserted,
+                "records_updated": records_updated,
+                "records_failed": records_failed,
+                "emails_added": emails_added,
+                "emails_updated": emails_updated,
                 "crm_status": crm_status_note,
                 "query": query.model_dump(),
             }

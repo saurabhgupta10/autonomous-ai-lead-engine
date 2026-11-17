@@ -25,3 +25,7 @@ Frontend/tsconfig.tsbuildinfo
 Backend/data/cache/
 Backend/data/discovery_sessions/
 Backend/acceptance_results.json
+
+.env
+.env.*
+!.env.example

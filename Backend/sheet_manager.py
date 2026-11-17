@@ -28,6 +28,7 @@ from config import (
     GOOGLE_SHEET_ID,
     GOOGLE_WORKSHEET_NAME,
 )
+from email_extractor import clean_and_validate_email
 
 logger = logging.getLogger(__name__)
 
@@ -185,96 +186,304 @@ def normalize_business_key(name: Any, city: Any) -> str:
     return f"{clean_name}|{clean_city}"
 
 
-def get_existing_crm_identifiers(worksheet: gspread.Worksheet) -> tuple[set[str], set[str], set[str]]:
+def get_column_letter(col_idx: int) -> str:
+    """Convert 1-based column index to A1 notation letter (1 -> A, 18 -> R, 27 -> AA)."""
+    result = ""
+    while col_idx > 0:
+        col_idx, remainder = divmod(col_idx - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+class SyncStats(dict):
     """
-    Extract existing domain, business keys, and provider IDs from CRM in 1 batch read.
-    Returns: (domains_set, business_keys_set, source_urls_set)
+    Rich synchronization statistics with backward-compatible tuple unpacking:
+    synced_count, dups_skipped = sync_discovered_leads_to_sheets(...)
     """
-    try:
-        records = with_retry(lambda: worksheet.get_all_records())
-    except Exception as exc:
-        logger.warning("Could not read existing CRM rows: %s", exc)
-        return set(), set(), set()
 
-    existing_domains: set[str] = set()
-    existing_keys: set[str] = set()
-    existing_sources: set[str] = set()
+    @property
+    def total_synced(self) -> int:
+        return self.get("records_inserted", 0) + self.get("records_updated", 0)
 
-    for r in records:
-        website = str(r.get("Website") or r.get("website") or "")
-        dom = normalize_domain(website)
-        if dom and "example.com" not in dom:
-            existing_domains.add(dom)
-
-        name = str(r.get("Business Name") or r.get("Company Name") or r.get("company_name") or "")
-        city = str(r.get("City") or r.get("city") or "")
-        if name:
-            existing_keys.add(normalize_business_key(name, city))
-
-        src = str(r.get("Source URL") or r.get("source_url") or "")
-        if src:
-            existing_sources.add(src.strip().lower())
-
-    return existing_domains, existing_keys, existing_sources
+    def __iter__(self):
+        yield self.total_synced
+        yield self.get("duplicates_skipped", 0)
 
 
-def sync_discovered_leads_to_sheets(records: list[Any]) -> tuple[int, int]:
+def sync_discovered_leads_to_sheets(records: list[Any]) -> SyncStats:
     """
-    Store newly discovered leads with persistent deduplication.
-    Returns: (appended_count, duplicates_skipped)
+    Insert new business leads and update existing business records in Google Sheets CRM.
+
+    Behaviors:
+      NEW BUSINESS:
+        - Insert a new spreadsheet row.
+        - Preserves all discovery metadata.
+      EXISTING BUSINESS:
+        - Identify existing row by normalized domain, business name + city, or source URL.
+        - Enrich missing email, phone, website, and updated AI opportunity analysis.
+        - Never replace an existing valid email with an empty or invalid value.
+        - Never create duplicate rows.
+
+    Returns:
+      SyncStats dictionary containing:
+        records_inserted, records_updated, duplicates_skipped,
+        records_failed, emails_added, emails_updated
     """
+    stats = SyncStats({
+        "records_inserted": 0,
+        "records_updated": 0,
+        "duplicates_skipped": 0,
+        "records_failed": 0,
+        "emails_added": 0,
+        "emails_updated": 0,
+    })
+
     if not records:
-        return 0, 0
+        return stats
 
     worksheet = get_worksheet()
     existing_headers = _ensure_header(worksheet)
-    existing_domains, existing_keys, existing_sources = get_existing_crm_identifiers(worksheet)
+    num_cols = len(existing_headers)
+    end_col_letter = get_column_letter(num_cols)
 
-    to_append: list[list[str]] = []
-    duplicates_skipped = 0
+    # Read all existing sheet values in 1 call (Row 1 = headers, Rows 2..N = data)
+    try:
+        all_rows = with_retry(lambda: worksheet.get_all_values())
+    except Exception as exc:
+        logger.error("Failed to read CRM spreadsheet values: %s", exc)
+        stats["records_failed"] = len(records)
+        return stats
+
+    if not all_rows:
+        all_rows = [existing_headers]
+
+    header_row = all_rows[0]
+    header_to_idx = {h.strip(): i for i, h in enumerate(header_row)}
+
+    # Map aliases for legacy compatibility
+    def get_cell(row_vals: list[str], col_name: str) -> str:
+        idx = header_to_idx.get(col_name)
+        if idx is not None and idx < len(row_vals):
+            return row_vals[idx].strip()
+        # Aliases
+        if col_name == "Business Name":
+            idx = header_to_idx.get("Company Name")
+            if idx is not None and idx < len(row_vals):
+                return row_vals[idx].strip()
+        elif col_name == "Company Name":
+            idx = header_to_idx.get("Business Name")
+            if idx is not None and idx < len(row_vals):
+                return row_vals[idx].strip()
+        elif col_name == "AI Reasoning":
+            idx = header_to_idx.get("Reason")
+            if idx is not None and idx < len(row_vals):
+                return row_vals[idx].strip()
+        elif col_name == "Reason":
+            idx = header_to_idx.get("AI Reasoning")
+            if idx is not None and idx < len(row_vals):
+                return row_vals[idx].strip()
+        return ""
+
+    def set_cell(row_vals: list[str], col_name: str, val: str) -> None:
+        idx = header_to_idx.get(col_name)
+        if idx is None:
+            # Check alias
+            if col_name == "Business Name":
+                idx = header_to_idx.get("Company Name")
+            elif col_name == "Company Name":
+                idx = header_to_idx.get("Business Name")
+            elif col_name == "AI Reasoning":
+                idx = header_to_idx.get("Reason")
+            elif col_name == "Reason":
+                idx = header_to_idx.get("AI Reasoning")
+
+        if idx is not None:
+            while len(row_vals) <= idx:
+                row_vals.append("")
+            row_vals[idx] = val
+
+    # Build row index for existing CRM records: key -> sheet_row_num (1-based), row_vals
+    # Keys tracked: domain, business_key, source_url
+    existing_row_map: dict[str, int] = {}
+    row_data_cache: dict[int, list[str]] = {}
+
+    for row_idx in range(1, len(all_rows)):
+        sheet_row_num = row_idx + 1
+        r_vals = list(all_rows[row_idx])
+        row_data_cache[sheet_row_num] = r_vals
+
+        website_val = get_cell(r_vals, "Website")
+        dom = normalize_domain(website_val)
+        if dom and "example.com" not in dom:
+            existing_row_map[f"dom:{dom}"] = sheet_row_num
+
+        name_val = get_cell(r_vals, "Business Name")
+        city_val = get_cell(r_vals, "City")
+        if name_val:
+            bkey = normalize_business_key(name_val, city_val)
+            existing_row_map[f"key:{bkey}"] = sheet_row_num
+
+        src_val = get_cell(r_vals, "Source URL").lower()
+        if src_val:
+            existing_row_map[f"src:{src_val}"] = sheet_row_num
+
+    staged_updates: list[dict[str, Any]] = []
+    to_insert: list[list[str]] = []
+    updated_row_nums: set[int] = set()
 
     for rec in records:
-        crm_dict = rec.to_crm_dict() if hasattr(rec, "to_crm_dict") else rec
+        try:
+            crm_dict = rec.to_crm_dict() if hasattr(rec, "to_crm_dict") else dict(rec)
 
-        website = crm_dict.get("Website", "")
-        domain = normalize_domain(website)
-        name = crm_dict.get("Business Name") or crm_dict.get("Company Name", "")
-        city = crm_dict.get("City", "")
-        bkey = normalize_business_key(name, city)
-        source_url = crm_dict.get("Source URL", "").strip().lower()
+            website = crm_dict.get("Website", "")
+            domain = normalize_domain(website)
+            name = crm_dict.get("Business Name") or crm_dict.get("Company Name", "")
+            city = crm_dict.get("City", "")
+            bkey = normalize_business_key(name, city)
+            source_url = crm_dict.get("Source URL", "").strip().lower()
 
-        # Check duplicate
-        is_dup = False
-        if domain and domain in existing_domains:
-            is_dup = True
-        elif bkey and bkey in existing_keys:
-            is_dup = True
-        elif source_url and source_url in existing_sources:
-            is_dup = True
+            matched_row_num: int | None = None
+            if domain and f"dom:{domain}" in existing_row_map:
+                matched_row_num = existing_row_map[f"dom:{domain}"]
+            elif bkey and f"key:{bkey}" in existing_row_map:
+                matched_row_num = existing_row_map[f"key:{bkey}"]
+            elif source_url and f"src:{source_url}" in existing_row_map:
+                matched_row_num = existing_row_map[f"src:{source_url}"]
 
-        if is_dup:
-            duplicates_skipped += 1
-            continue
+            new_email = clean_and_validate_email(crm_dict.get("Email")) or ""
+            new_phone = str(crm_dict.get("Phone") or "").strip()
+            new_web = str(crm_dict.get("Website") or "").strip()
 
-        # Add to local seen sets
-        if domain:
-            existing_domains.add(domain)
-        if bkey:
-            existing_keys.add(bkey)
-        if source_url:
-            existing_sources.add(source_url)
+            if matched_row_num is not None:
+                # ── EXISTING BUSINESS: Inspect and Enrich ───────────────────
+                current_vals = row_data_cache[matched_row_num]
+                row_changed = False
 
-        # Map to current worksheet column order
-        row = [str(crm_dict.get(col, "")) for col in existing_headers]
-        to_append.append(row)
+                curr_email = get_cell(current_vals, "Email")
+                curr_valid_email = clean_and_validate_email(curr_email)
 
-    if to_append:
-        with_retry(
-            lambda: worksheet.append_rows(to_append, value_input_option="USER_ENTERED")
-        )
-        logger.info("Successfully appended %d new leads (%d duplicates skipped).", len(to_append), duplicates_skipped)
+                # Email update logic
+                if new_email:
+                    if not curr_email or not curr_valid_email:
+                        # Existing email was missing or invalid; populate with newly discovered valid email
+                        set_cell(current_vals, "Email", new_email)
+                        row_changed = True
+                        stats["emails_added"] += 1
+                        logger.info("Enriched missing email for row %d: %s", matched_row_num, new_email)
+                    elif curr_valid_email and curr_valid_email != new_email:
+                        # If existing email is already valid, preserve it
+                        logger.debug("Preserving existing valid email '%s' over '%s'", curr_valid_email, new_email)
 
-    return len(to_append), duplicates_skipped
+                # Phone update logic
+                curr_phone = get_cell(current_vals, "Phone")
+                if not curr_phone and new_phone:
+                    set_cell(current_vals, "Phone", new_phone)
+                    row_changed = True
+
+                # Website update logic
+                curr_web = get_cell(current_vals, "Website")
+                if not curr_web and new_web:
+                    set_cell(current_vals, "Website", new_web)
+                    row_changed = True
+
+                # AI and opportunity metadata updates
+                enrichment_fields = [
+                    "Opportunity Type", "Priority", "AI Score",
+                    "AI Reasoning", "Evidence", "Website Status"
+                ]
+                for fld in enrichment_fields:
+                    new_fld_val = str(crm_dict.get(fld) or "").strip()
+                    curr_fld_val = get_cell(current_vals, fld)
+                    if new_fld_val and new_fld_val != curr_fld_val and (not curr_fld_val or curr_fld_val in {"Unscored", "General Automation", "50", "unverified"}):
+                        set_cell(current_vals, fld, new_fld_val)
+                        row_changed = True
+
+                if row_changed:
+                    set_cell(current_vals, "Last Updated", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+                    if matched_row_num not in updated_row_nums:
+                        updated_row_nums.add(matched_row_num)
+                        stats["records_updated"] += 1
+                        # Pad row to full header length
+                        while len(current_vals) < num_cols:
+                            current_vals.append("")
+                        staged_updates.append({
+                            "range": f"A{matched_row_num}:{end_col_letter}{matched_row_num}",
+                            "values": [current_vals[:num_cols]],
+                        })
+                else:
+                    stats["duplicates_skipped"] += 1
+
+            else:
+                # ── NEW BUSINESS: Insert Fresh CRM Row ──────────────────────
+                row_vals: list[str] = []
+                for col in existing_headers:
+                    val = crm_dict.get(col)
+                    if val is None:
+                        # Check aliases
+                        if col == "Company Name":
+                            val = crm_dict.get("Business Name", "")
+                        elif col == "Business Name":
+                            val = crm_dict.get("Company Name", "")
+                        elif col == "Reason":
+                            val = crm_dict.get("AI Reasoning", "")
+                        elif col == "AI Reasoning":
+                            val = crm_dict.get("Reason", "")
+                        else:
+                            val = ""
+                    row_vals.append(str(val))
+
+                to_insert.append(row_vals)
+                stats["records_inserted"] += 1
+                if new_email:
+                    stats["emails_added"] += 1
+
+                # Register in local map to prevent duplication within same batch
+                projected_row_num = len(all_rows) + len(to_insert)
+                if domain:
+                    existing_row_map[f"dom:{domain}"] = projected_row_num
+                if bkey:
+                    existing_row_map[f"key:{bkey}"] = projected_row_num
+                if source_url:
+                    existing_row_map[f"src:{source_url}"] = projected_row_num
+                row_data_cache[projected_row_num] = row_vals
+
+        except Exception as rec_err:
+            logger.error("Error processing lead record for CRM sync: %s", rec_err)
+            stats["records_failed"] += 1
+
+    # Execute batch updates for modified existing rows
+    if staged_updates:
+        try:
+            logger.info("Executing batch update for %d modified CRM rows...", len(staged_updates))
+            with_retry(
+                lambda: worksheet.batch_update(staged_updates, value_input_option="USER_ENTERED")
+            )
+        except Exception as update_err:
+            logger.error("Failed to batch update existing CRM rows: %s", update_err)
+            stats["records_failed"] += len(staged_updates)
+
+    # Execute batch append for new rows
+    if to_insert:
+        try:
+            logger.info("Executing batch append for %d new CRM rows...", len(to_insert))
+            with_retry(
+                lambda: worksheet.append_rows(to_insert, value_input_option="USER_ENTERED")
+            )
+        except Exception as insert_err:
+            logger.error("Failed to batch append new CRM rows: %s", insert_err)
+            stats["records_failed"] += len(to_insert)
+
+    logger.info(
+        "CRM Sync complete: %d inserted, %d updated, %d skipped, %d failed. Emails: +%d added, %d updated.",
+        stats["records_inserted"],
+        stats["records_updated"],
+        stats["duplicates_skipped"],
+        stats["records_failed"],
+        stats["emails_added"],
+        stats["emails_updated"],
+    )
+
+    return stats
 
 
 # ── Legacy Scraper Pipeline Compatibility ─────────────────────────────────────

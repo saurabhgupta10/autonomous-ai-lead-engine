@@ -4,8 +4,16 @@ test_phase5.py
 Automated test suite for Phase 5 Autonomous Business Discovery & Website Intelligence.
 """
 
+import os
 import sys
+from pathlib import Path
+
+BACKEND_DIR = Path(__file__).resolve().parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
 import unittest
+from unittest.mock import patch
 from discovery.discovery_schemas import DiscoveryQuery
 from discovery.overpass_provider import OverpassDiscoveryProvider
 from crawler import audit_website, is_ssrf_safe_url
@@ -28,8 +36,9 @@ class TestWebsiteAuditing(unittest.TestCase):
         safe, _ = is_ssrf_safe_url("ftp://example.com")
         self.assertFalse(safe)
 
-        safe, _ = is_ssrf_safe_url("https://www.google.com")
-        self.assertTrue(safe)
+        with patch("socket.getaddrinfo", return_value=[(None, None, None, None, ("142.250.190.46", 443))]):
+            safe, _ = is_ssrf_safe_url("https://www.google.com")
+            self.assertTrue(safe)
 
     def test_missing_website(self):
         result = audit_website(None)

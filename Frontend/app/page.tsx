@@ -128,8 +128,21 @@ export default function Page() {
 
   // Normalize raw record into LeadItem
   const normalizeLead = (record: RawLeadRecord, index: number): LeadItem => {
-    const company =
-      record['Business Name'] || record['Company Name'] || record.business_name || record.company_name || record.company || 'Unknown Prospect'
+   const rawCompany =
+  record['Business Name'] ||
+  record['Company Name'] ||
+  record.business_name ||
+  record.company_name ||
+  record.company ||
+  'Unknown Prospect'
+
+const company =
+  typeof rawCompany === 'string'
+    ? rawCompany
+    : typeof rawCompany === 'number'
+      ? String(rawCompany)
+      : 'Unknown Prospect'
+      
     const timestamp =
       record['Timestamp (UTC)'] || record.timestamp || record['Discovery Date'] || record.Captured || 'Recently'
     const country = record.Country || record.country || 'Global'

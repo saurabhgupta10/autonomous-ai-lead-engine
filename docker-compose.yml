@@ -12,12 +12,17 @@ services:
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-flash-lite-latest}
-      - SPREADSHEET_ID=${SPREADSHEET_ID}
+      - GOOGLE_SHEET_ID=${GOOGLE_SHEET_ID:-${SPREADSHEET_ID}}
+      - SPREADSHEET_ID=${SPREADSHEET_ID:-${GOOGLE_SHEET_ID}}
+      - GOOGLE_WORKSHEET_NAME=${GOOGLE_WORKSHEET_NAME:-Leads}
+      - GOOGLE_SERVICE_ACCOUNT_FILE=/app/credentials/service_account.json
       - SERVICE_ACCOUNT_FILE=/app/credentials/service_account.json
       - API_BEARER_TOKEN=${API_BEARER_TOKEN:-}
+      - FRONTEND_ORIGIN=http://localhost:3000
       - ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
-      - OSM_USER_AGENT=AutonomousLeadEngine/2.0
-      - OSM_CONTACT_EMAIL=${OSM_CONTACT_EMAIL:-contact@example.com}
+      - OSM_USER_AGENT=LeadGenEngineApp/2.0 (+https://github.com/saurabhgupta10/autonomous-ai-lead-engine; contact@leadengine.local)
+      - OSM_CONTACT_EMAIL=${OSM_CONTACT_EMAIL:-contact@leadengine.local}
+      - CACHE_TTL_HOURS=${CACHE_TTL_HOURS:-24}
     volumes:
       - ./Backend/credentials:/app/credentials:ro
       - ./Backend/data:/app/data
